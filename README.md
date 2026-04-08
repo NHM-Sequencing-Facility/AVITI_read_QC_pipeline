@@ -4,7 +4,6 @@ A snakemake pipeline for QC of raw, baecalled and demultiplexed AVITI24 sequence
 Takes a the AVITI24 RunManifest.csv and a parent directory of FASTQ files (Samples/), merges samples across lanes, concatenates where needed, runs pre-QC FastQC, fastp QC, post-QC FastQC, and aggregates everything into a single MultiQC report. PhiX entries and Unassigned reads are excluded.
 
 
-
 ## Dependencies & installation
 1. Clone this repository.
 2. Install all necessary dependencies listed in `aviti_read_qc_pipeline.yaml` provided in this repository, using the following commands:
@@ -37,6 +36,9 @@ conda activate aviti_read_qc_pipeline
 ## Workflow overview
 **Rule worklow:** lane_merge → pre_fastqc → fastp → post_fastqc → multiqc
 
+<div align="center">
+  <img width="384" height="546" src="https://github.com/user-attachments/assets/2c39a63c-1ea0-463a-ab3f-05c6e7f5df7d">
+</div>
 
 ### Sample grouping and lane concatenation
 Samples are grouped by matching Index1 + Index2 pairs listed in RunManifest.csv. Samples sharing the same index pair (i.e. the same library sequenced across multiple lanes) are concatenated before QC. A name-based validation layer checks that grouped sample names share a common prefix, and a warning is written to sample_manifest.log if this looks suspicious (but the pipeline does not fail). 
