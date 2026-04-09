@@ -81,26 +81,14 @@ The following parameters are configruable within the `config.config.yaml`
   - `qualified_quality_phred`: Phred score threshold; bases below this are 'unqualified'
   - `unqualified_percent_limit`: Maximum % of unqualified bases allowed per read before it is discarded
   - `dedup`: Flag to set whether identical read pairs are deduplicated, or not
-  - `trim_poly_g`: 
-  - `trim_poly_x`:
+  - `trim_poly_g`: If enabled, Fastp can detect the polyG in read tails and trims them. PolyG can happen in read tails since G means no signal in the Illumina two-color systems
+  - `trim_poly_x`: If enabled, Fastp can detect polyX (e.g. polyA) tails and trims them. If polyG and polyX tail trimming are both enabled, fastp will perform polyG trimming first, then perform polyX trimming
   - `correction`: Overlap-based base correction for paired-end reads. it has the following parameters by default: overlap_len_require (default 30), overlap_diff_limit (default 5) and overlap_diff_percent_limit (default 20%)
   - `extra_args`: Any additional fastp arguments that are not already configurable
 - MultiQC:
   - `extra_args`: Any additional multiqc arguments that are not already configurable
 - rules: Controls memory and threading resource allocation given to each rule. 
 
-
-
-### Python helper functions
-- validate_config(config) — Sanity-checks the config.yaml before anything else runs. Confirms all required keys exist, that path values point to real files/directories, and that numeric fastp parameters are valid types. Exits with a clear error message rather than letting Snakemake fail cryptically mid-run.
-- parse_run_manifest(manifest_path) — Reads the RunManifest.csv line by line, handling the two-section format ([SETTINGS] and [SAMPLES]), skipping comment lines and blank lines. Returns the settings dict, the list of sample rows, and a list of already-skipped entries (PhiX).
-- group_samples_by_index(samples_rows) — Takes the flat list of sample rows and groups them into a dict keyed by (Index1, Index2) tuple. This is the primary grouping authority — samples sharing an index pair are the same biological library across lanes.
-- longest_common_prefix(strings) — Pure string utility. Compares a list of strings character by character and returns the longest prefix shared by all of them. Used to derive base sample names from grouped lane names.
-- derive_base_name(names) — Calls longest_common_prefix then strips any trailing non-alphanumeric characters (e.g. trailing underscores or hyphens) from the result. Converts ["Pan1", "Pan1a"] → "Pan1" cleanly.
-- validate_name_grouping(base_name, names, index_key) — The name-matching validation layer on top of index grouping. Warns (but never fails) if the derived base name is suspiciously short (< 3 chars) or if any sample name in the group doesn't start with the base name. Results go to the manifest log.
-- find_fastq_files(sample_name, samples_dir) — Recursively globs under samples_dir for files matching {sample_name}_*_R1*.fastq.gz and _R2*. Applies strict_filter to prevent prefix collisions (e.g. Pan1 matching Pan1a files) by anchoring the regex to require an underscore immediately after the sample name.
-- build_sample_table(config) — Orchestrates everything above. Calls parse → group → find files for each group → validates names → assembles the final sample_table dict that all Snakemake rules read from. Also accumulates the processed/skipped/warnings lists for logging.
-write_manifest_log(...) — Writes a human-readable summary of the entire sample resolution process to logs/sample_manifest.log before any jobs run. Critically useful for verifying grouping is correct before committing cluster resources.
 
 ---
 
