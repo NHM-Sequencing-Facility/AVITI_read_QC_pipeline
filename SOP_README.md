@@ -1,36 +1,22 @@
 ---
 title: "SOP: Running the AVITI Read QC Pipeline"
-author: "Dan Parsons"
+author: "Dan Parsons @NHMUK"
 date: "`14.04.2026`"
-output:
-  html_document:
-    toc: true
-    toc_depth: 2
-    toc_float: true
-    theme: flatly
-    highlight: tango
----
-
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
-```
-
 ---
 
 ## Overview
 
-This SOP describes how to configure and run the `aviti_read_qc_pipeline` — a Snakemake-based
-pipeline for QC of raw, basecalled, and demultiplexed AVITI24 sequencing data. The pipeline
+This simple SOP describes how to configure and run the `aviti_read_qc_pipeline` (a Snakemake-based
+pipeline for QC of raw, basecalled, and demultiplexed AVITI24 sequencing data). The pipeline
 merges lane replicates, runs fastp trimming, falco (FastQC) reporting, and seqkit stats, and
-aggregates everything into a single MultiQC report.
+aggregates everything into a fastp summary spreadsheet and MultiQC report.
 
 **Prerequisites:** conda must be installed and the repository must be cloned before starting.
 
 ---
 
-## Step 1 — Locate your inputs
-
-Confirm you have the following before proceeding:
+## Step 1 - Locate your inputs
+Confirm you have run Base2Fastq.slurm on the raw AVITI sequencer output, and have access to the following before proceeding:
 
 - The run's `RunManifest.csv`
 - The parent `Samples/` directory containing per-sample FASTQ subdirectories
@@ -46,8 +32,7 @@ FASTQ files must follow this naming convention:
 
 ---
 
-## Step 2 — Create and activate the conda environment
-
+## Step 2 - Create and activate the conda environment
 Run these commands once per installation. Skip if the environment already exists.
 
 ```{bash}
@@ -57,21 +42,13 @@ conda env create -f aviti_read_qc_pipeline.yaml
 # Activate it
 conda activate aviti_read_qc_pipeline
 
-# Verify key dependencies
+# Verify a key dependency
 snakemake --version   # expected: 9.9.0
-fastp --version       # expected: 1.3.1
 ```
 
 ---
 
-## Step 3 — Configure the run
-
-Copy the example config and populate it for your run:
-
-```{bash}
-cp config/config.yaml.example config/config.yaml
-```
-
+## Step 3 - Configure the run
 Open `config/config.yaml` and fill in the following required fields:
 
 | Parameter | Description |
@@ -87,17 +64,16 @@ Adjust fastp parameters if needed — defaults are appropriate for most AVITI ru
 
 ---
 
-## Step 4 — Dry run
-
-Always perform a dry run before submitting to SLURM to catch configuration errors early:
+## Step 4 - Dry run (optional: recommended for first time running the pipeline)
+Perform a dry run before submitting to SLURM to catch any configuration errors:
 
 ```{bash}
 conda activate aviti_read_qc_pipeline
+cd aviti_read_qc_pipeline
 snakemake -n --quiet
 ```
 
 Check that:
-
 - The printed job list looks correct
 - Sample counts match your expectations
 - `logs/sample_manifest.log` contains no unexpected grouping warnings
@@ -107,14 +83,13 @@ Check that:
 
 ---
 
-## Step 5 — Submit to SLURM
+## Step 5 - Submit to SLURM
 
 ```{bash}
-sbatch aviti_read_qc_pipeline.slurm
+sbatch aviti_read_qc_pipeline.sh
 ```
 
 Monitor job progress:
-
 ```{bash}
 squeue -u $USER
 ```
@@ -126,43 +101,39 @@ Per-rule logs are written to `logs/<rule>/`. If a job fails, check the relevant 
 
 ---
 
-## Step 6 — Review outputs
-
+## Step 6 - Review outputs
 Once the pipeline completes, review the following:
+
+**SLURM run log:**
+```
+aviti_read_qc_pipeline/aviti_read_qc_pipeline_{job_id}.err
+```
+> Does the 'rule all' show 100% completion?
 
 **MultiQC report** — open in a browser:
 ```
 multiqc_report/{run_name}_multiqc_report.html
 ```
+> Does the file exist? Does it open without any errors?
 
 **Per-sample fastp summary CSV:**
 ```
 02_fastp/{run_name}_fastp_summary.csv
 ```
-
-Flag any samples meeting the following criteria for review:
-
-- Duplication rate **> 20%**
-- Post-filter read count **< 1 million**
-- Q30 rate **< 80%**
+> Does the file exist? Is it populated with data correctly?
 
 ---
 
-## Step 7 — Archive
-
-Once downstream analysis inputs are confirmed:
-
+## Step 7 - Archive
+Once the run is finished (in approximetly 1-5 hours) and inputs are confirmed:
 ```{bash}
-# Compress the output directory
-zip -r {run_name}_outputs.zip output_dir/
+# Compress the output directory into a gzipped tarball
+tar czf <name_of_directory_to_tar>.tar.gz <name_of_directory_to_tar/>
 
 # Transfer to appropriate project storage
 # (update path as needed)
-cp {run_name}_outputs.zip /path/to/project/storage/
+cp <name_of_directory_to_tar>.tar.g /path/to/storage/
 ```
-
-> Raw merged FASTQ files in `00_lane_merge/` can be deleted once you have confirmed
-> they are no longer needed as pipeline inputs.
 
 ---
 
@@ -192,5 +163,3 @@ output_dir/
 | MultiQC report missing samples | Rule failed upstream | Check `logs/` for the failing rule |
 
 ---
-
-*Pipeline written by Dan Parsons for NHMUK Molecular Biology Laboratories.*
