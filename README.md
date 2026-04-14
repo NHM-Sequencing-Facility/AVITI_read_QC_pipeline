@@ -1,4 +1,7 @@
+<img width="300" height="150" alt="NHM_logo_new" src="https://github.com/user-attachments/assets/7d72e101-621a-4b3b-9d28-2bb7e5e2a085" />
+
 # AVITI_read_QC_pipeline
+
 A snakemake pipeline for QC of raw, basecalled and demultiplexed AVITI24 sequence data, written for the MBL team @NHMUK.
 
 The pipeline takes an AVITI24 RunManifest.csv and a parent directory of raw FASTQ files (Samples/), merges replicate samples across lanes, concatenates replicates where needed, runs pre-QC FastQC (falco), fastp QC, post-QC FastQC (falco) and Seqkit stats, and then produces a summary spreadsheet of fastp QC metrics and aggregates everything into a single MultiQC report. PhiX entries and Unassigned reads are excluded.
