@@ -4,7 +4,7 @@
 
 A snakemake pipeline for QC of raw, basecalled and demultiplexed AVITI24 sequence data, written for the MBL team @NHMUK.
 
-The pipeline takes an AVITI24 RunManifest.csv and a parent directory of raw FASTQ files (Samples/), merges replicate samples across lanes, concatenates replicates where needed, runs pre-QC FastQC (falco), fastp QC, post-QC FastQC (falco) and Seqkit stats, and then produces a summary spreadsheet of fastp QC metrics and aggregates everything into a single MultiQC report. PhiX entries and Unassigned reads are excluded.
+The pipeline takes an AVITI24 RunManifest.csv and a parent directory of raw FASTQ files (Samples/), concatenates replicates (where needed) across lanes, runs pre-QC FastQC (falco), fastp QC, post-QC FastQC (falco) and Seqkit stats, and then produces a summary spreadsheet of fastp QC metrics and aggregates everything into a single MultiQC report. PhiX entries and Unassigned reads are excluded.
 
 ---
 
