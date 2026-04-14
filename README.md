@@ -32,8 +32,10 @@ conda activate aviti_read_qc_pipeline
 ## Quick start
 1. Follow the installation and conda env creation steps above.
 2. Populate `config/config.yaml` with the required run paremeters and paths.
-3. Run `sbatch aviti_read_qc_pipeline.slurm` to execute the pipeline. This script will submit all required jobs to a SLURM HPC.
-> Within aviti_read_qc_pipeline.sh, you will need to edit the conda 'source' line to correctly point to your `conda.sh`, as well as your NHM email address.
+3. Edit conda 'source' line to correctly point to your `conda.sh` and your NHM email address within `aviti_read_qc_pipeline.sh`
+4. Run `sbatch aviti_read_qc_pipeline.slurm` to execute the pipeline. This script will submit all required jobs to a SLURM HPC.
+
+> **A detailed, step-by-step SOP can be found [here](https://github.com/SchistoDan/AVITI_read_QC_pipeline/blob/main/SOP_README.md).**
 
 ---
 
@@ -128,12 +130,6 @@ output_dir/
     ├── post_qc/
     └── multiqc/
 ```
-
----
-
-## Run SOP
-Please see the dedicated SOP_README.md for step by step guidance on setting up and running the pipeline.
-
 
 ---
 
