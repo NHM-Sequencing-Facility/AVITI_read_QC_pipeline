@@ -1,0 +1,83 @@
+# config/config.yaml
+# AVITI raw read QC Pipeline configuration
+
+# ===== GENERAL =====
+# Unique identifier for this run (used in output filenames and MultiQC report)
+run_name: "RUN_1"
+
+# Path to the RunManifest.csv file. The Samples/ directory is derived automatically from the run_manifest path
+run_manifest: "/path/to/runmanifest.csv"
+additional_run_manifests:
+  - /patho/to/any/additional/runmanifest.csv
+
+# Directory where all pipeline outputs will be written (created if absent)
+output_dir: "/path/to/output/directory"
+
+# Activate merging of replicate samples across AVITI lanes (true/false)
+lane_merge:
+  enabled: true   # set false to symlink single-lane samples through instead of copying; errors if a sample has multiple lanes. Must be set true if >1 manifest provided.
+
+
+# ===== FASTP PARAMETERS =====
+# All parameters are optional; defaults shown below will be used if omitted
+fastp:
+  # Adapter sequences for R1 and R2
+  # Default adapters listed below are Illumina TruSeq adapters
+  adapter_r1: "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"
+  adapter_r2: "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"
+
+  # Quality filtering
+  qualified_quality_phred: 15   # Phred score threshold; bases below this are 'unqualified' (default: 15)
+  unqualified_percent_limit: 40 # Maximum % of unqualified bases allowed per read before it is discarded (default: 40)
+  min_length: 15                # Minimum read length after trimming; shorter reads are discarded (default: 15)
+
+  # Deduplication: mark and remove PCR/optical duplicates
+  dedup: true                   # (default: true)
+
+  # Poly-G/X  trimming - When both enabled, fastp will perform polyG trimming first, then perform polyX trimming
+  trim_poly_g: true             # Trim poly-G tails (default: true. If enabled, trim_poly_g = 10)
+  trim_poly_x: false            # Trim poly-X tails (default: false. If enabled, trim_poly_x = 10)
+
+  # Overlap-based base correction for paired-end reads
+  # It has the following parameters by default: overlap_len_require (default 30), overlap_diff_limit (default 5) and overlap_diff_percent_limit (default 20%)
+  correction: false             # Enable overlap correction (default: false)
+
+  # Any additional fastp arguments as a raw string, e.g.:
+  #   extra_args: "--cut_front --cut_tail --cut_window_size 4 --cut_mean_quality 20"
+  extra_args: ""
+
+
+# ===== MULTIQC PARAMETERS =====
+
+multiqc:
+  # Any additional multiqc arguments as a raw string, e.g.:
+  #   extra_args: "--ignore *_R2_* --cl-config 'fastqc_theoretical_gc: null'"
+  extra_args: ""
+
+
+# ===== RESOURCE ALLOCATION =====
+# mem_mb: memory in megabytes (scaled by retry attempt number on failure)
+# threads: number of CPU threads
+# partition: SLURM partition name (only used when running via SLURM profile)
+
+rules:
+  lane_merge:
+    mem_mb: 16384      # 16 GB
+    threads: 8         # 8 threads
+    partition: "day"
+  fastqc:
+    mem_mb: 16384      # 16 GB per sample
+    threads: 8         # 8 threads
+    partition: "day"
+  fastp:
+    mem_mb: 16384      # 16 GB
+    threads: 8         # 8 threads
+    partition: "day"
+  seqkit:
+    mem_mb: 16384      # 16 GB
+    threads: 8         # 8 threads
+    partition: "day"
+  multiqc:
+    mem_mb: 16384      # 16 GB
+    threads: 2         # 2 threads
+    partition: "day"
