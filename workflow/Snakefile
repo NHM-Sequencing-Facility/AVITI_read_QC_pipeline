@@ -1,0 +1,1051 @@
+import os
+import sys
+import csv
+import re
+import glob
+from pathlib import Path
+from datetime import datetime
+
+
+# ===== CONFIGURATION VALIDATION =====
+
+def validate_config(config):
+    """Validate top-level required configuration keys and paths."""
+    required_keys = ["run_manifest", "output_dir", "run_name"]
+    missing = [k for k in required_keys if k not in config]
+    if missing:
+        sys.stderr.write(f"ERROR: Missing required config keys: {', '.join(missing)}\n")
+        sys.exit(1)
+
+    if not os.path.exists(config["run_manifest"]):
+        sys.stderr.write(f"ERROR: run_manifest not found: {config['run_manifest']}\n")
+        sys.exit(1)
+
+    # Validate additional_run_manifests if present
+    extra_manifests = config.get("additional_run_manifests", [])
+    if not isinstance(extra_manifests, list):
+        sys.stderr.write("ERROR: additional_run_manifests must be a list in config.yaml\n")
+        sys.exit(1)
+    for p in extra_manifests:
+        if not os.path.exists(p):
+            sys.stderr.write(f"ERROR: additional_run_manifests entry not found: {p}\n")
+            sys.exit(1)
+
+    # Cross-run merging requires lane_merge to be enabled — merged samples will
+    # always have n_lanes > 1, which lane_merge.py hard-fails on when disabled
+    if extra_manifests:
+        lane_merge_enabled = config.get("lane_merge", {}).get("enabled", True)
+        if not lane_merge_enabled:
+            sys.stderr.write(
+                "ERROR: additional_run_manifests is set but lane_merge.enabled is false. "
+                "Cross-run sample merging requires lane_merge to be enabled — merged "
+                "samples will always have n_lanes > 1. "
+                "Set lane_merge.enabled: true in config.yaml.\n"
+            )
+            sys.exit(1)
+
+    # Validate fastp config block if present
+    fastp_cfg = config.get("fastp", {})
+    min_len = fastp_cfg.get("min_length", 36)
+    try:
+        min_len = int(min_len)
+        if min_len < 1:
+            raise ValueError
+    except (ValueError, TypeError):
+        sys.stderr.write("ERROR: fastp.min_length must be a positive integer\n")
+        sys.exit(1)
+
+    qual = fastp_cfg.get("qualified_quality_phred", 15)
+    try:
+        qual = int(qual)
+        if qual < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        sys.stderr.write("ERROR: fastp.qualified_quality_phred must be a non-negative integer\n")
+        sys.exit(1)
+
+    # Validate lane_merge config block if present
+    lane_merge_cfg = config.get("lane_merge", {})
+    if "enabled" in lane_merge_cfg and not isinstance(lane_merge_cfg["enabled"], bool):
+        sys.stderr.write("ERROR: lane_merge.enabled must be true or false (boolean) in config.yaml\n")
+        sys.exit(1)
+
+    # Validate rule resources block
+    if "rules" not in config:
+        sys.stderr.write("ERROR: Missing 'rules' resource block in config\n")
+        sys.exit(1)
+
+    required_rules = ["lane_merge", "fastqc", "fastp", "seqkit", "multiqc"]
+    missing_rules = [r for r in required_rules if r not in config["rules"]]
+    if missing_rules:
+        sys.stderr.write(f"ERROR: Missing resource definitions for rules: {', '.join(missing_rules)}\n")
+        sys.exit(1)
+
+
+# ===== MANIFEST PARSING =====
+
+def parse_run_manifest(manifest_path):
+    """
+    Parse a RunManifest.csv file.
+
+    Returns:
+        samples_section (list of dicts): rows from [SAMPLES] block, excluding PhiX
+            and commented-out lines.
+        skipped (list of str): sample names excluded (PhiX or commented).
+        settings (dict): key/value pairs from [SETTINGS] block.
+    """
+    settings = {}
+    samples_section = []
+    skipped = []
+
+    in_settings = False
+    in_samples = False
+    samples_header = None
+
+    with open(manifest_path, "r") as fh:
+        for raw_line in fh:
+            line = raw_line.rstrip("\n")
+
+            # Strip trailing commas/whitespace for section detection
+            stripped = line.strip().rstrip(",").strip()
+
+            # Skip blank lines
+            if not stripped:
+                continue
+
+            # Skip comment lines
+            if stripped.startswith("#"):
+                continue
+
+            # Section headers
+            if stripped == "[SETTINGS]":
+                in_settings = True
+                in_samples = False
+                continue
+            if stripped == "[SAMPLES]":
+                in_settings = False
+                in_samples = True
+                samples_header = None
+                continue
+
+            if in_settings:
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 2 and parts[0] and parts[0] != "SettingName":
+                    settings[parts[0]] = parts[1]
+                continue
+
+            if in_samples:
+                parts = [p.strip() for p in line.split(",")]
+
+                # First non-comment, non-blank line in [SAMPLES] is the header
+                if samples_header is None:
+                    samples_header = parts
+                    continue
+
+                # Build row dict (pad if row is shorter than header)
+                parts += [""] * (len(samples_header) - len(parts))
+                row = {samples_header[i]: parts[i] for i in range(len(samples_header))}
+
+                sample_name = row.get("SampleName", "").strip()
+                if not sample_name:
+                    continue
+
+                # Exclude PhiX
+                if sample_name.lower().startswith("phix"):
+                    skipped.append((sample_name, "PhiX control"))
+                    continue
+
+                samples_section.append(row)
+
+    return samples_section, skipped, settings
+
+
+def group_samples_by_index(samples_rows):
+    """
+    Group manifest rows by (Index1, Index2) pair.
+
+    Returns:
+        groups (dict): { (index1, index2): [row, ...] }
+    """
+    groups = {}
+    for row in samples_rows:
+        idx1 = row.get("Index1", "").strip().upper()
+        idx2 = row.get("Index2", "").strip().upper()
+        key = (idx1, idx2)
+        groups.setdefault(key, []).append(row)
+    return groups
+
+
+def longest_common_prefix(strings):
+    """Return the longest common prefix of a list of strings."""
+    if not strings:
+        return ""
+    prefix = strings[0]
+    for s in strings[1:]:
+        while not s.startswith(prefix):
+            prefix = prefix[:-1]
+            if not prefix:
+                return ""
+    return prefix
+
+
+def derive_base_name(names):
+    """
+    Derive a clean base sample name from a list of per-lane sample names.
+    Uses longest common prefix, then strips trailing non-alphanumeric characters.
+    """
+    lcp = longest_common_prefix(names)
+    # Strip trailing non-alphanumeric characters
+    base = re.sub(r"[^a-zA-Z0-9]+$", "", lcp)
+    return base if base else lcp
+
+
+def validate_name_grouping(base_name, names, index_key):
+    """
+    Validate that all names in a group share the derived base name as a prefix.
+    Returns a warning string if suspicious, else None.
+    """
+    warnings = []
+    if len(base_name) < 3:
+        warnings.append(
+            f"WARNING: Base name '{base_name}' derived from index pair "
+            f"{index_key} is suspiciously short (< 3 chars). "
+            f"Sample names in group: {names}. "
+            f"Please verify these are truly the same biological sample."
+        )
+    for name in names:
+        if not name.startswith(base_name):
+            warnings.append(
+                f"WARNING: Sample '{name}' does not start with derived base "
+                f"name '{base_name}' for index pair {index_key}. "
+                f"Manual check recommended."
+            )
+    return warnings
+
+
+def index_fastq_files(samples_dir):
+    """
+    Walk samples_dir once and return a dict mapping basename -> full path
+    for every *.fastq.gz file found recursively.
+
+    This single traversal replaces per-sample glob calls, which are slow on
+    networked HPC filesystems (one recursive glob per sample x 96 samples
+    can take several minutes).
+    """
+    index = {}
+    pattern = os.path.join(samples_dir, "**", "*.fastq.gz")
+    for path in glob.glob(pattern, recursive=True):
+        bn = os.path.basename(path)
+        if bn in index:
+            bn_repr = repr(bn)
+            sys.stderr.write(
+                "WARNING: Duplicate filename " + bn_repr + " found in samples_dir:\n"
+                "  existing : " + index[bn] + "\n"
+                "  duplicate: " + path + "\n"
+                "  The first occurrence will be used.\n"
+            )
+        else:
+            index[bn] = path
+    return index
+
+
+def find_fastq_files(sample_name, fastq_index):
+    """
+    Query the pre-built fastq_index (basename -> path) for files belonging
+    to sample_name. Applies the same strict prefix filter as before to avoid
+    e.g. Pan1 matching Pan1a.
+
+    Returns:
+        r1_files (list), r2_files (list) - both sorted for deterministic lane order.
+    """
+    r1_pat = re.compile(rf"^{re.escape(sample_name)}_.*R1.*\.fastq\.gz$")
+    r2_pat = re.compile(rf"^{re.escape(sample_name)}_.*R2.*\.fastq\.gz$")
+
+    r1_files = sorted(path for bn, path in fastq_index.items() if r1_pat.match(bn))
+    r2_files = sorted(path for bn, path in fastq_index.items() if r2_pat.match(bn))
+
+    return r1_files, r2_files
+
+
+def parse_single_run(manifest_path):
+    """
+    Parse one manifest and its sibling Samples/ directory into a per-run
+    sample table. Duplicate base_name within a single run is still a hard
+    error (two different index pairs resolving to the same name is a manifest
+    mistake). Cross-run duplicates are handled by build_sample_table.
+    """
+    manifest_rows, initially_skipped, settings = parse_run_manifest(manifest_path)
+    groups = group_samples_by_index(manifest_rows)
+
+    samples_dir = os.path.join(
+        os.path.dirname(os.path.abspath(manifest_path)), "Samples"
+    )
+    if not os.path.isdir(samples_dir):
+        sys.stderr.write(
+            f"ERROR: Expected Samples/ directory not found: {samples_dir}\n"
+            f"  (derived from manifest: {manifest_path})\n"
+        )
+        sys.exit(1)
+
+    print(f"Indexing FASTQ files under: {samples_dir}", file=sys.stderr)
+    fastq_index = index_fastq_files(samples_dir)
+    print(f"Found {len(fastq_index)} FASTQ files in index.", file=sys.stderr)
+
+    run_table = {}
+    processed = []
+    skipped = list(initially_skipped)
+    warnings = []
+
+    for index_key, rows in groups.items():
+        names = [r["SampleName"] for r in rows]
+        base_name = derive_base_name(names)
+        warnings.extend(validate_name_grouping(base_name, names, index_key))
+
+        all_r1, all_r2, missing_samples = [], [], []
+        for name in names:
+            r1, r2 = find_fastq_files(name, fastq_index)
+            if not r1 or not r2:
+                missing_samples.append(name)
+                continue
+            if len(r1) != len(r2):
+                sys.stderr.write(
+                    f"ERROR: Mismatched R1/R2 file counts for sample '{name}' "
+                    f"(R1: {len(r1)}, R2: {len(r2)}). Skipping group '{base_name}'.\n"
+                )
+                missing_samples.append(name)
+                continue
+            all_r1.extend(r1)
+            all_r2.extend(r2)
+
+        if missing_samples:
+            for ms in missing_samples:
+                skipped.append((ms, f"No FASTQ files found under {samples_dir}"))
+
+        if not all_r1:
+            skipped.append((base_name, "No FASTQ files found for any lane in group"))
+            continue
+
+        if base_name in run_table:
+            sys.stderr.write(
+                f"ERROR: Duplicate base name '{base_name}' derived from two different "
+                f"index pairs in {manifest_path}. This is a manifest error. Exiting.\n"
+            )
+            sys.exit(1)
+
+        run_table[base_name] = {
+            "r1": all_r1,
+            "r2": all_r2,
+            "lane_names": names,
+            "index_key": index_key,
+            "n_lanes": len(all_r1),
+        }
+        processed.append(base_name)
+
+    return run_table, processed, skipped, warnings, settings
+
+# ===== BUILD SAMPLE TABLE =====
+
+def build_sample_table(config):
+    """
+    Parse the primary manifest plus any additional_run_manifests, merging
+    FASTQ file lists for samples that appear in more than one run.
+
+    - Same sample in multiple runs: r1/r2 lists are extended; lane_merge.py
+      concatenates them in the lane_merge rule.
+    - Sample unique to one run: included as-is, single-lane copy/symlink path.
+    - [SETTINGS] mismatch between any two manifests: hard exit with a clear
+      diff of the conflicting keys.
+    - Same sample name but different index pair across runs: warning (not
+      an error, since re-indexing is legitimate, but worth flagging).
+
+    Returns sample_sources in addition to the standard tuple so write_manifest_log
+    can record which manifest(s) contributed files to each sample.
+    """
+    manifest_paths = [config["run_manifest"]] + config.get("additional_run_manifests", [])
+
+    sample_table = {}
+    sample_sources = {}   # base_name -> [(manifest_path, r1_files, r2_files)]
+    index_keys_seen = {}  # base_name -> {manifest_path: index_key}
+    all_processed = []
+    all_skipped = []
+    all_warnings = []
+    merged_settings = None
+
+    for manifest_path in manifest_paths:
+        run_table, run_processed, run_skipped, run_warnings, run_settings = \
+            parse_single_run(manifest_path)
+
+        all_skipped.extend(run_skipped)
+        all_warnings.extend(run_warnings)
+
+        # Settings consistency check — exit on any key mismatch
+        if merged_settings is None:
+            merged_settings = run_settings
+        else:
+            all_keys = set(merged_settings) | set(run_settings)
+            mismatches = []
+            for key in sorted(all_keys):
+                v_primary = merged_settings.get(key, "<absent>")
+                v_this    = run_settings.get(key, "<absent>")
+                if v_primary != v_this:
+                    mismatches.append(
+                        f"  {key}:\n"
+                        f"    primary ({manifest_paths[0]}): {v_primary!r}\n"
+                        f"    this    ({manifest_path}):     {v_this!r}"
+                    )
+            if mismatches:
+                sys.stderr.write(
+                    f"ERROR: [SETTINGS] mismatch between manifests. "
+                    f"Resolve these before merging runs:\n"
+                    + "\n".join(mismatches) + "\n"
+                )
+                sys.exit(1)
+
+        # Merge this run's samples into the combined table
+        for base_name, info in run_table.items():
+            if base_name not in sample_table:
+                sample_table[base_name] = {
+                    "r1": [],
+                    "r2": [],
+                    "lane_names": [],
+                    "index_key": info["index_key"],
+                    "n_lanes": 0,
+                }
+                all_processed.append(base_name)
+
+            sample_table[base_name]["r1"].extend(info["r1"])
+            sample_table[base_name]["r2"].extend(info["r2"])
+            sample_table[base_name]["lane_names"].extend(info["lane_names"])
+            sample_table[base_name]["n_lanes"] += info["n_lanes"]
+
+            sample_sources.setdefault(base_name, []).append(
+                (manifest_path, info["r1"], info["r2"])
+            )
+            index_keys_seen.setdefault(base_name, {})[manifest_path] = info["index_key"]
+
+    # Warn if the same sample appears with a different index pair across runs
+    for base_name, by_manifest in index_keys_seen.items():
+        unique_keys = set(by_manifest.values())
+        if len(unique_keys) > 1:
+            all_warnings.append(
+                f"WARNING: Sample '{base_name}' has different index pairs across runs: "
+                f"{by_manifest}. Confirm this is intentional (e.g. re-indexed library) "
+                f"before trusting the merge."
+            )
+
+    return (
+        sample_table, all_processed, all_skipped,
+        all_warnings, merged_settings or {}, sample_sources
+    )
+
+
+def write_manifest_log(log_path, sample_table, processed, skipped, warnings, settings, config, sample_sources=None):
+    """Write a human-readable manifest log summarising what was and wasn't processed."""
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    manifest_paths = [config["run_manifest"]] + config.get("additional_run_manifests", [])
+
+    with open(log_path, "w") as fh:
+        fh.write("=" * 60 + "\n")
+        fh.write("QC Pipeline - Sample Manifest Log\n")
+        fh.write(f"Run name  : {config['run_name']}\n")
+        fh.write(f"Manifests ({len(manifest_paths)} total):\n")
+        for mp in manifest_paths:
+            fh.write(f"  {mp}\n")
+        fh.write(f"Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        fh.write("=" * 60 + "\n\n")
+
+        fh.write("[SETTINGS from manifest]\n")
+        for k, v in settings.items():
+            fh.write(f"  {k}: {v}\n")
+        fh.write("\n")
+
+        fh.write(f"[PROCESSED SAMPLES] ({len(processed)} total)\n")
+        for base_name in processed:
+            info = sample_table[base_name]
+            sources = (sample_sources or {}).get(base_name, [])
+            n_runs = len(sources)
+            fh.write(f"  {base_name}\n")
+            fh.write(f"    Index pair : {info['index_key']}\n")
+            fh.write(f"    Lane names : {info['lane_names']}\n")
+            fh.write(f"    N lanes    : {info['n_lanes']}\n")
+            fh.write(f"    N runs     : {n_runs}")
+            if n_runs > 1:
+                fh.write("  (cross-run merge)")
+            fh.write("\n")
+            for manifest_path, r1_files, r2_files in sources:
+                fh.write(f"    Run : {manifest_path}\n")
+                fh.write(f"      R1 files :\n")
+                for f in r1_files:
+                    fh.write(f"        {f}\n")
+                fh.write(f"      R2 files :\n")
+                for f in r2_files:
+                    fh.write(f"        {f}\n")
+        fh.write("\n")
+
+        fh.write(f"[SKIPPED SAMPLES] ({len(skipped)} total)\n")
+        for entry in skipped:
+            if isinstance(entry, tuple):
+                fh.write(f"  {entry[0]}: {entry[1]}\n")
+            else:
+                fh.write(f"  {entry}\n")
+        fh.write("\n")
+
+        if warnings:
+            fh.write(f"[WARNINGS] ({len(warnings)} total)\n")
+            for w in warnings:
+                fh.write(f"  {w}\n")
+            fh.write("\n")
+        else:
+            fh.write("[WARNINGS] None\n\n")
+
+
+# ===== INITIALISE =====
+
+validate_config(config)
+
+sample_table, processed_samples, skipped_samples, manifest_warnings, manifest_settings, sample_sources = \
+    build_sample_table(config)
+
+if not sample_table:
+    sys.stderr.write("ERROR: No samples could be resolved from the manifest. Exiting.\n")
+    sys.exit(1)
+
+manifest_log_path = os.path.join(config["output_dir"], "logs", "sample_manifest.log")
+write_manifest_log(
+    manifest_log_path, sample_table, processed_samples,
+    skipped_samples, manifest_warnings, manifest_settings, config,
+    sample_sources=sample_sources
+)
+
+for w in manifest_warnings:
+    sys.stderr.write(w + "\n")
+
+n_merged = sum(1 for sources in sample_sources.values() if len(sources) > 1)
+
+print(f"\n{'='*60}", file=sys.stderr)
+print(f"QC Pipeline initialised : {config['run_name']}", file=sys.stderr)
+print(f"Manifests processed     : {1 + len(config.get('additional_run_manifests', []))}", file=sys.stderr)
+print(f"Samples to process      : {len(sample_table)}", file=sys.stderr)
+if n_merged:
+    print(f"Cross-run merges        : {n_merged}", file=sys.stderr)
+print(f"Samples skipped         : {len(skipped_samples)}", file=sys.stderr)
+print(f"Manifest log            : {manifest_log_path}", file=sys.stderr)
+print(f"{'='*60}\n", file=sys.stderr)
+
+
+# ===== PATHS AND PARAMETERS =====
+
+output_dir      = config["output_dir"]
+run_name        = config["run_name"]
+rule_resources  = config["rules"]
+fastp_cfg       = config.get("fastp", {})
+lane_merge_cfg  = config.get("lane_merge", {})
+lane_merge_enabled = lane_merge_cfg.get("enabled", True)
+
+lane_merge_dir  = os.path.join(output_dir, "00_lane_merge")
+pre_qc_dir      = os.path.join(output_dir, "01_pre_qc")
+fastp_dir       = os.path.join(output_dir, "02_fastp")
+post_qc_dir     = os.path.join(output_dir, "03_post_qc")
+seqkit_dir      = os.path.join(output_dir, "04_seqkit")
+multiqc_dir     = os.path.join(output_dir, "multiqc_report")
+logs_dir        = os.path.join(output_dir, "logs")
+
+SAMPLES = list(sample_table.keys())
+
+
+# ===== RULE ALL =====
+
+rule all:
+    input:
+        # Lane merge outputs
+        expand(os.path.join(lane_merge_dir, "{sample}", "{sample}_R1.fastq.gz"), sample=SAMPLES),
+        expand(os.path.join(lane_merge_dir, "{sample}", "{sample}_R2.fastq.gz"), sample=SAMPLES),
+        expand(os.path.join(logs_dir, "lane_merge", "{sample}.log"), sample=SAMPLES),
+
+        # Pre-QC FastQC
+        expand(os.path.join(pre_qc_dir, "{sample}", "{sample}_R1_fastqc.html"), sample=SAMPLES),
+        expand(os.path.join(pre_qc_dir, "{sample}", "{sample}_R2_fastqc.html"), sample=SAMPLES),
+
+        # fastp outputs
+        expand(os.path.join(fastp_dir, "{sample}", "{sample}_R1.fastq.gz"), sample=SAMPLES),
+        expand(os.path.join(fastp_dir, "{sample}", "{sample}_R2.fastq.gz"), sample=SAMPLES),
+        expand(os.path.join(fastp_dir, "{sample}", "{sample}_fastp.html"), sample=SAMPLES),
+        expand(os.path.join(fastp_dir, "{sample}", "{sample}_fastp.json"), sample=SAMPLES),
+
+        # Post-QC FastQC
+        expand(os.path.join(post_qc_dir, "{sample}", "{sample}_R1_fastqc.html"), sample=SAMPLES),
+        expand(os.path.join(post_qc_dir, "{sample}", "{sample}_R2_fastqc.html"), sample=SAMPLES),
+
+        # seqkit stats
+        expand(os.path.join(seqkit_dir, "{sample}", "{sample}_seqkit_stats.txt"), sample=SAMPLES),
+
+        # fastp summary CSV
+        os.path.join(fastp_dir, f"{run_name}_fastp_summary.csv"),
+
+        # MultiQC
+        os.path.join(multiqc_dir, f"{run_name}_multiqc_report.html"),
+
+
+# ===== RULE: LANE MERGE =====
+
+rule lane_merge:
+    output:
+        r1=os.path.join(lane_merge_dir, "{sample}", "{sample}_R1.fastq.gz"),
+        r2=os.path.join(lane_merge_dir, "{sample}", "{sample}_R2.fastq.gz"),
+        log_file=os.path.join(logs_dir, "lane_merge", "{sample}.log")
+    params:
+        r1_inputs  =lambda wildcards: " ".join(sample_table[wildcards.sample]["r1"]),
+        r2_inputs  =lambda wildcards: " ".join(sample_table[wildcards.sample]["r2"]),
+        lane_names =lambda wildcards: " ".join(sample_table[wildcards.sample]["lane_names"]),
+        index1     =lambda wildcards: sample_table[wildcards.sample]["index_key"][0],
+        index2     =lambda wildcards: sample_table[wildcards.sample]["index_key"][1],
+        lane_merge_enabled=lane_merge_enabled,
+        script     =os.path.join(workflow.basedir, "scripts", "lane_merge.py")
+    threads: rule_resources["lane_merge"]["threads"]
+    resources:
+        mem_mb=lambda wildcards, attempt: rule_resources["lane_merge"]["mem_mb"] * attempt,
+        slurm_partition=rule_resources["lane_merge"].get("partition", "")
+    retries: 2
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p $(dirname {output.r1})
+        mkdir -p $(dirname {output.log_file})
+
+        python {params.script} \
+            --r1 {params.r1_inputs} \
+            --r2 {params.r2_inputs} \
+            --out-r1 {output.r1} \
+            --out-r2 {output.r2} \
+            --log {output.log_file} \
+            --sample {wildcards.sample} \
+            --lane-names {params.lane_names} \
+            --index1 "{params.index1}" \
+            --index2 "{params.index2}" \
+            --lane-merge-enabled {params.lane_merge_enabled}
+        """
+
+
+# ===== RULE: PRE-QC FALCO =====
+# Falco is a FastQC-compatible drop-in replacement. Output files are parsed
+# identically by MultiQC. We run R1 and R2 as separate falco calls and use 
+# the -R/-D/-S flags to control output filenames explicitly, 
+# giving standard {sample}_R{1,2}_fastqc.{html,zip} naming that MultiQC expects.
+rule pre_fastqc:
+    input:
+        r1=os.path.join(lane_merge_dir, "{sample}", "{sample}_R1.fastq.gz"),
+        r2=os.path.join(lane_merge_dir, "{sample}", "{sample}_R2.fastq.gz")
+    output:
+        r1_html=os.path.join(pre_qc_dir, "{sample}", "{sample}_R1_fastqc.html"),
+        r1_zip =os.path.join(pre_qc_dir, "{sample}", "{sample}_R1_fastqc.zip"),
+        r2_html=os.path.join(pre_qc_dir, "{sample}", "{sample}_R2_fastqc.html"),
+        r2_zip =os.path.join(pre_qc_dir, "{sample}", "{sample}_R2_fastqc.zip")
+    params:
+        outdir=os.path.join(pre_qc_dir, "{sample}"),
+        extra_args=config.get("falco", {}).get("extra_args", "")
+    log:
+        out=os.path.join(logs_dir, "pre_qc", "{sample}.out"),
+        err=os.path.join(logs_dir, "pre_qc", "{sample}.err")
+    threads: rule_resources["fastqc"]["threads"]
+    resources:
+        mem_mb=lambda wildcards, attempt: rule_resources["fastqc"]["mem_mb"] * attempt,
+        slurm_partition=rule_resources["fastqc"].get("partition", "")
+    retries: 2
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p {params.outdir}
+        mkdir -p $(dirname {log.out})
+
+        echo "Pre-QC falco: {wildcards.sample}" > {log.out}
+        echo "Started: $(date)" >> {log.out}
+        echo "Input R1: {input.r1}" >> {log.out}
+        echo "Input R2: {input.r2}" >> {log.out}
+
+        # Check for empty input (placeholder from lane_merge)
+        if [[ ! -s "{input.r1}" ]] || [[ ! -s "{input.r2}" ]]; then
+            echo "WARNING: Input file(s) are empty — sample had no usable reads after lane merge." >> {log.out}
+            echo "Creating empty placeholder outputs and skipping falco." >> {log.out}
+            touch {output.r1_html} {output.r1_zip} {output.r2_html} {output.r2_zip}
+            echo "Completed (skipped): $(date)" >> {log.out}
+            exit 0
+        fi
+
+        # Run falco on R1
+        echo "Running falco on R1..." >> {log.out}
+        falco \
+            --outdir {params.outdir} \
+            -R {params.outdir}/{wildcards.sample}_R1_fastqc.html \
+            -D {params.outdir}/{wildcards.sample}_R1_fastqc_data.txt \
+            -S {params.outdir}/{wildcards.sample}_R1_fastqc_summary.txt \
+            {params.extra_args} \
+            {input.r1} \
+            >> {log.out} 2>> {log.err}
+
+        # Run falco on R2
+        echo "Running falco on R2..." >> {log.out}
+        falco \
+            --outdir {params.outdir} \
+            -R {params.outdir}/{wildcards.sample}_R2_fastqc.html \
+            -D {params.outdir}/{wildcards.sample}_R2_fastqc_data.txt \
+            -S {params.outdir}/{wildcards.sample}_R2_fastqc_summary.txt \
+            {params.extra_args} \
+            {input.r2} \
+            >> {log.out} 2>> {log.err}
+
+        cd {params.outdir}
+        for read in R1 R2; do
+            sample_read={wildcards.sample}_${{read}}
+            zip_name=${{sample_read}}_fastqc.zip
+            inner_dir=${{sample_read}}_fastqc
+
+            mkdir -p "$inner_dir"
+            cp ${{sample_read}}_fastqc_data.txt "$inner_dir/fastqc_data.txt"
+            cp ${{sample_read}}_fastqc_summary.txt  "$inner_dir/summary.txt"
+            cp ${{sample_read}}_fastqc.html         "$inner_dir/fastqc_report.html"
+
+            zip -r "$zip_name" "$inner_dir" \
+                >> {log.out} 2>> {log.err}
+
+            rm -rf "$inner_dir"
+        done
+
+        echo "Completed: $(date)" >> {log.out}
+        """
+
+
+# ===== RULE: FASTP =====
+
+rule fastp:
+    input:
+        r1=os.path.join(lane_merge_dir, "{sample}", "{sample}_R1.fastq.gz"),
+        r2=os.path.join(lane_merge_dir, "{sample}", "{sample}_R2.fastq.gz")
+    output:
+        r1  =os.path.join(fastp_dir, "{sample}", "{sample}_R1.fastq.gz"),
+        r2  =os.path.join(fastp_dir, "{sample}", "{sample}_R2.fastq.gz"),
+        html=os.path.join(fastp_dir, "{sample}", "{sample}_fastp.html"),
+        json=os.path.join(fastp_dir, "{sample}", "{sample}_fastp.json")
+    params:
+        # Adapter trimming
+        adapter_r1             = fastp_cfg.get("adapter_r1", "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA"),
+        adapter_r2             = fastp_cfg.get("adapter_r2", "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT"),
+        # Quality filtering
+        qualified_quality_phred= fastp_cfg.get("qualified_quality_phred", 15),
+        unqualified_percent    = fastp_cfg.get("unqualified_percent_limit", 40),
+        min_length             = fastp_cfg.get("min_length", 15),
+        # Optional flags
+        dedup_flag             = "--dedup" if fastp_cfg.get("dedup", True) else "",
+        trim_poly_g_flag       = "--trim_poly_g" if fastp_cfg.get("trim_poly_g", True) else "",
+        trim_poly_x_flag       = "--trim_poly_x" if fastp_cfg.get("trim_poly_x", False) else "",
+        correction_flag        = "--correction" if fastp_cfg.get("correction", False) else "",
+        extra_args             = fastp_cfg.get("extra_args", "")
+    log:
+        out=os.path.join(logs_dir, "fastp", "{sample}.out"),
+        err=os.path.join(logs_dir, "fastp", "{sample}.err")
+    threads: rule_resources["fastp"]["threads"]
+    resources:
+        mem_mb=lambda wildcards, attempt: rule_resources["fastp"]["mem_mb"] * attempt,
+        slurm_partition=rule_resources["fastp"].get("partition", "")
+    retries: 3
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p $(dirname {output.r1})
+        mkdir -p $(dirname {log.out})
+
+        echo "======== fastp: {wildcards.sample} ========" > {log.out}
+        echo "Started : $(date)" >> {log.out}
+        echo "Input R1: {input.r1}" >> {log.out}
+        echo "Input R2: {input.r2}" >> {log.out}
+        echo "Threads : {threads}" >> {log.out}
+        echo "Params  :" >> {log.out}
+        echo "  adapter_r1             : {params.adapter_r1}" >> {log.out}
+        echo "  adapter_r2             : {params.adapter_r2}" >> {log.out}
+        echo "  qualified_quality_phred: {params.qualified_quality_phred}" >> {log.out}
+        echo "  unqualified_percent    : {params.unqualified_percent}" >> {log.out}
+        echo "  min_length             : {params.min_length}" >> {log.out}
+        echo "  dedup                  : {params.dedup_flag}" >> {log.out}
+        echo "  trim_poly_g            : {params.trim_poly_g_flag}" >> {log.out}
+        echo "  trim_poly_x            : {params.trim_poly_x_flag}" >> {log.out}
+        echo "  correction             : {params.correction_flag}" >> {log.out}
+        echo "  extra_args             : {params.extra_args}" >> {log.out}
+        echo "==========================================" >> {log.out}
+
+        # Check for empty input (placeholder from lane_merge)
+        if [[ ! -s "{input.r1}" ]] || [[ ! -s "{input.r2}" ]]; then
+            echo "WARNING: Input file(s) are empty — sample had no usable reads after lane merge." >> {log.out}
+            echo "Creating empty placeholder outputs and skipping fastp." >> {log.out}
+            touch {output.r1} {output.r2} {output.html} {output.json}
+            echo "Completed (skipped): $(date)" >> {log.out}
+            exit 0
+        fi
+
+        echo "Input file sizes:" >> {log.out}
+        echo "  R1: $(numfmt --to=iec $(stat -c%s {input.r1}))" >> {log.out}
+        echo "  R2: $(numfmt --to=iec $(stat -c%s {input.r2}))" >> {log.out}
+
+        fastp \
+            -i {input.r1} -I {input.r2} \
+            -o {output.r1} -O {output.r2} \
+            --adapter_sequence {params.adapter_r1} \
+            --adapter_sequence_r2 {params.adapter_r2} \
+            --qualified_quality_phred {params.qualified_quality_phred} \
+            --unqualified_percent_limit {params.unqualified_percent} \
+            --length_required {params.min_length} \
+            {params.dedup_flag} \
+            {params.trim_poly_g_flag} \
+            {params.trim_poly_x_flag} \
+            {params.correction_flag} \
+            {params.extra_args} \
+            --thread {threads} \
+            --html {output.html} \
+            --json {output.json} \
+            >> {log.out} 2>> {log.err}
+
+        echo "Output file sizes:" >> {log.out}
+        echo "  R1: $(numfmt --to=iec $(stat -c%s {output.r1}))" >> {log.out}
+        echo "  R2: $(numfmt --to=iec $(stat -c%s {output.r2}))" >> {log.out}
+        echo "Completed: $(date)" >> {log.out}
+        """
+
+
+# ===== RULE: POST-QC FALCO =====
+
+rule post_fastqc:
+    input:
+        r1=os.path.join(fastp_dir, "{sample}", "{sample}_R1.fastq.gz"),
+        r2=os.path.join(fastp_dir, "{sample}", "{sample}_R2.fastq.gz")
+    output:
+        r1_html=os.path.join(post_qc_dir, "{sample}", "{sample}_R1_fastqc.html"),
+        r1_zip =os.path.join(post_qc_dir, "{sample}", "{sample}_R1_fastqc.zip"),
+        r2_html=os.path.join(post_qc_dir, "{sample}", "{sample}_R2_fastqc.html"),
+        r2_zip =os.path.join(post_qc_dir, "{sample}", "{sample}_R2_fastqc.zip")
+    params:
+        outdir=os.path.join(post_qc_dir, "{sample}"),
+        extra_args=config.get("falco", {}).get("extra_args", "")
+    log:
+        out=os.path.join(logs_dir, "post_qc", "{sample}.out"),
+        err=os.path.join(logs_dir, "post_qc", "{sample}.err")
+    threads: rule_resources["fastqc"]["threads"]
+    resources:
+        mem_mb=lambda wildcards, attempt: rule_resources["fastqc"]["mem_mb"] * attempt,
+        slurm_partition=rule_resources["fastqc"].get("partition", "")
+    retries: 2
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p {params.outdir}
+        mkdir -p $(dirname {log.out})
+
+        echo "Post-QC falco: {wildcards.sample}" > {log.out}
+        echo "Started: $(date)" >> {log.out}
+        echo "Input R1: {input.r1}" >> {log.out}
+        echo "Input R2: {input.r2}" >> {log.out}
+
+        # Check for empty input (placeholder from fastp skip)
+        if [[ ! -s "{input.r1}" ]] || [[ ! -s "{input.r2}" ]]; then
+            echo "WARNING: Input file(s) are empty — sample had no usable reads after fastp." >> {log.out}
+            echo "Creating empty placeholder outputs and skipping falco." >> {log.out}
+            touch {output.r1_html} {output.r1_zip} {output.r2_html} {output.r2_zip}
+            echo "Completed (skipped): $(date)" >> {log.out}
+            exit 0
+        fi
+
+        # Run falco on R1
+        echo "Running falco on R1..." >> {log.out}
+        falco \
+            --outdir {params.outdir} \
+            -R {params.outdir}/{wildcards.sample}_R1_fastqc.html \
+            -D {params.outdir}/{wildcards.sample}_R1_fastqc_data.txt \
+            -S {params.outdir}/{wildcards.sample}_R1_fastqc_summary.txt \
+            {params.extra_args} \
+            {input.r1} \
+            >> {log.out} 2>> {log.err}
+
+        # Run falco on R2
+        echo "Running falco on R2..." >> {log.out}
+        falco \
+            --outdir {params.outdir} \
+            -R {params.outdir}/{wildcards.sample}_R2_fastqc.html \
+            -D {params.outdir}/{wildcards.sample}_R2_fastqc_data.txt \
+            -S {params.outdir}/{wildcards.sample}_R2_fastqc_summary.txt \
+            {params.extra_args} \
+            {input.r2} \
+            >> {log.out} 2>> {log.err}
+
+        cd {params.outdir}
+        for read in R1 R2; do
+            sample_read={wildcards.sample}_${{read}}
+            zip_name=${{sample_read}}_fastqc.zip
+            inner_dir=${{sample_read}}_fastqc
+
+            mkdir -p "$inner_dir"
+            cp ${{sample_read}}_fastqc_data.txt "$inner_dir/fastqc_data.txt"
+            cp ${{sample_read}}_fastqc_summary.txt  "$inner_dir/summary.txt"
+            cp ${{sample_read}}_fastqc.html         "$inner_dir/fastqc_report.html"
+
+            zip -r "$zip_name" "$inner_dir" \
+                >> {log.out} 2>> {log.err}
+
+            rm -rf "$inner_dir"
+        done
+
+        echo "Completed: $(date)" >> {log.out}
+        """
+
+
+
+# ===== RULE: SEQKIT STATS =====
+
+rule seqkit_stats:
+    input:
+        r1=os.path.join(fastp_dir, "{sample}", "{sample}_R1.fastq.gz"),
+        r2=os.path.join(fastp_dir, "{sample}", "{sample}_R2.fastq.gz")
+    output:
+        stats=os.path.join(seqkit_dir, "{sample}", "{sample}_seqkit_stats.txt")
+    log:
+        out=os.path.join(logs_dir, "seqkit", "{sample}.out"),
+        err=os.path.join(logs_dir, "seqkit", "{sample}.err")
+    threads: rule_resources["seqkit"]["threads"]
+    resources:
+        mem_mb=lambda wildcards, attempt: rule_resources["seqkit"]["mem_mb"] * attempt,
+        slurm_partition=rule_resources["seqkit"].get("partition", "")
+    retries: 2
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p $(dirname {output.stats})
+        mkdir -p $(dirname {log.out})
+
+        echo "seqkit stats: {wildcards.sample}" > {log.out}
+        echo "Started: $(date)" >> {log.out}
+        echo "Input R1: {input.r1}" >> {log.out}
+        echo "Input R2: {input.r2}" >> {log.out}
+
+        # Check for empty input (placeholder from fastp skip)
+        if [[ ! -s "{input.r1}" ]] || [[ ! -s "{input.r2}" ]]; then
+            echo "WARNING: Input file(s) are empty — sample had no usable reads after fastp." >> {log.out}
+            echo "Creating empty placeholder output and skipping seqkit stats." >> {log.out}
+            touch {output.stats}
+            echo "Completed (skipped): $(date)" >> {log.out}
+            exit 0
+        fi
+
+        seqkit stats \
+            --all \
+            --tabular \
+            {input.r1} {input.r2} \
+            > {output.stats} \
+            2>> {log.err}
+
+        echo "Completed: $(date)" >> {log.out}
+        echo "Output:" >> {log.out}
+        cat {output.stats} >> {log.out}
+        """
+
+
+# ===== RULE: FASTP SUMMARY CSV =====
+
+rule fastp_summary:
+    input:
+        jsons=expand(os.path.join(fastp_dir, "{sample}", "{sample}_fastp.json"), sample=SAMPLES)
+    output:
+        csv=os.path.join(fastp_dir, f"{run_name}_fastp_summary.csv"),
+        mqc=os.path.join(fastp_dir, f"{run_name}_general_stats_mqc.yaml")
+    params:
+        script=os.path.join(workflow.basedir, "scripts", "parse_fastp_stats.py"),
+        fastp_dir=fastp_dir
+    log:
+        out=os.path.join(logs_dir, "fastp_summary", "fastp_summary.out"),
+        err=os.path.join(logs_dir, "fastp_summary", "fastp_summary.err")
+    threads: 1
+    resources:
+        mem_mb=4096,
+        slurm_partition=rule_resources["fastp"].get("partition", "")
+    retries: 2
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p $(dirname {log.out})
+
+        echo "fastp summary: {run_name}" > {log.out}
+        echo "Started: $(date)" >> {log.out}
+        echo "Input dir: {params.fastp_dir}" >> {log.out}
+        echo "Output CSV: {output.csv}" >> {log.out}
+        echo "Output MQC yaml: {output.mqc}" >> {log.out}
+
+        python {params.script} \
+            --input {params.fastp_dir} \
+            --output {output.csv} \
+            --output-mqc {output.mqc} \
+            >> {log.out} 2>> {log.err}
+
+        echo "Completed: $(date)" >> {log.out}
+        echo "Rows in output: $(wc -l < {output.csv})" >> {log.out}
+        """
+
+
+
+# ===== RULE: MULTIQC =====
+
+rule multiqc:
+    input:
+        # Pre-QC FastQC
+        expand(os.path.join(pre_qc_dir,  "{sample}", "{sample}_R1_fastqc.zip"), sample=SAMPLES),
+        expand(os.path.join(pre_qc_dir,  "{sample}", "{sample}_R2_fastqc.zip"), sample=SAMPLES),
+        # fastp JSON reports
+        expand(os.path.join(fastp_dir,   "{sample}", "{sample}_fastp.json"), sample=SAMPLES),
+        # custom general-stats yaml: raw/final reads & bases from fastp JSON reports
+        os.path.join(fastp_dir, f"{run_name}_general_stats_mqc.yaml"),
+        # Post-QC FastQC
+        expand(os.path.join(post_qc_dir, "{sample}", "{sample}_R1_fastqc.zip"), sample=SAMPLES),
+        expand(os.path.join(post_qc_dir, "{sample}", "{sample}_R2_fastqc.zip"), sample=SAMPLES),
+        # seqkit stats
+        expand(os.path.join(seqkit_dir, "{sample}", "{sample}_seqkit_stats.txt"), sample=SAMPLES),
+        # MultiQC config
+        config_yaml=os.path.normpath(os.path.join(workflow.basedir, "..", "config", "multiqc_config.yaml"))
+    output:
+        report=os.path.join(multiqc_dir, f"{run_name}_multiqc_report.html"),
+        data_dir=directory(os.path.join(multiqc_dir, f"{run_name}_multiqc_report_data"))
+    params:
+        search_dirs=f"{pre_qc_dir} {fastp_dir} {post_qc_dir} {seqkit_dir}",
+        outdir=multiqc_dir,
+        report_name=f"{run_name}_multiqc_report",
+        extra_args=config.get("multiqc", {}).get("extra_args", "")
+    log:
+        out=os.path.join(logs_dir, "multiqc", "multiqc.out"),
+        err=os.path.join(logs_dir, "multiqc", "multiqc.err")
+    threads: rule_resources["multiqc"]["threads"]
+    resources:
+        mem_mb=lambda wildcards, attempt: rule_resources["multiqc"]["mem_mb"] * attempt,
+        slurm_partition=rule_resources["multiqc"].get("partition", "")
+    retries: 2
+    shell:
+        """
+        set -euo pipefail
+
+        mkdir -p {params.outdir}
+        mkdir -p $(dirname {log.out})
+
+        echo "MultiQC aggregation" > {log.out}
+        echo "Started : $(date)" >> {log.out}
+        echo "Searching: {params.search_dirs}" >> {log.out}
+        echo "Output  : {params.outdir}" >> {log.out}
+
+        multiqc \
+            {params.search_dirs} \
+            --outdir {params.outdir} \
+            --filename {params.report_name} \
+            --force \
+            -c {input.config_yaml} \
+            {params.extra_args} \
+            >> {log.out} 2>> {log.err}
+
+        echo "Completed: $(date)" >> {log.out}
+        """
