@@ -8,7 +8,7 @@ run_name: "RUN_1"
 # Path to the RunManifest.csv file. The Samples/ directory is derived automatically from the run_manifest path
 run_manifest: "/path/to/runmanifest.csv"
 additional_run_manifests:
-  - /patho/to/any/additional/runmanifest.csv
+  - /path/to/any/additional/runmanifest.csv
 
 # Optional: merge samples with different names across runs into a single output sample.
 # Map each desired output name to the list of per-run SampleName values (or their
@@ -25,9 +25,10 @@ additional_run_manifests:
 # Directory where all pipeline outputs will be written (created if absent)
 output_dir: "/path/to/output/directory"
 
+
 # Activate merging of replicate samples across AVITI lanes (true/false)
 lane_merge:
-  enabled: true   # set false to symlink single-lane samples through instead of copying; errors if a sample has multiple lanes. Must be set true if >1 manifest provided.
+  enabled: false   # set false to symlink single-lane samples through instead of copying; errors if a sample has multiple lanes. Must be set true if >1 manifest provided.
 
 
 # ===== FASTP PARAMETERS =====
@@ -59,29 +60,20 @@ fastp:
   extra_args: ""
 
 
-# ===== REFERENCE MAPPING (optional) =====
+# ===== REFERENCE MAPPING =====
 # Aligns each sample's fastp-trimmed reads to a reference genome with BWA-MEM and
-# reports mapping statistics via samtools flagstat. Disabled by default; when
-# disabled, no mapping jobs are added to the workflow at all.
-#
-# This is by far the most expensive step in the pipeline — budget walltime and
-# partition accordingly (see rules.mapping below).
+# reports mapping statistics via samtools flagstat. Disabled by default.
+  mapping:
 mapping:
-  enabled: false                # set true to align reads and report mapping stats (default: false)
+  enabled: true                # set true to align reads and report mapping stats (default: false)
 
   # Path to the reference genome FASTA. Required when enabled: true.
-  # The BWA index (.amb/.ann/.bwt/.pac/.sa) is built automatically if absent, which
-  # requires the reference's directory to be writable. If it is read-only, build the
-  # index yourself first with: bwa index /path/to/reference.fasta
-  reference: ""
+  # The BWA index is built automatically if absent.
+  reference: "/hpc/scratch/DP/andie_sif/GCF_902686455.1_mSciVul1.2_genomic.fna.gz"
 
   # Retain a coordinate-sorted, indexed BAM per sample.
-  # false (default): bwa mem is piped straight into samtools flagstat — no sorting and
-  #   no BAM written, so mapping costs almost no disk. Use this when you only want the
-  #   mapping statistics.
-  # true: writes {sample}.sorted.bam + .bai to 05_mapping/{sample}/. Expect tens of GB
-  #   per sample at typical AVITI depths.
-  keep_bam: false
+  # false (default).
+  keep_bam: true
 
 
 # ===== FALCO PARAMETERS =====
@@ -93,7 +85,6 @@ falco:
 
 
 # ===== MULTIQC PARAMETERS =====
-
 multiqc:
   # Any additional multiqc arguments as a raw string, e.g.:
   #   extra_args: "--ignore *_R2_* --cl-config 'fastqc_theoretical_gc: null'"
@@ -104,7 +95,6 @@ multiqc:
 # mem_mb: memory in megabytes (scaled by retry attempt number on failure)
 # threads: number of CPU threads
 # partition: SLURM partition name (only used when running via SLURM profile)
-
 rules:
   lane_merge:
     mem_mb: 16384      # 16 GB
@@ -126,10 +116,7 @@ rules:
     mem_mb: 16384      # 16 GB
     threads: 2         # 2 threads
     partition: "day"
-  # Only used when mapping.enabled is true. Deliberately larger than the other rules:
-  # BWA-MEM holds the whole reference index in memory and is the pipeline's heaviest
-  # step. If this block is omitted entirely, the defaults shown here are used.
   mapping:
     mem_mb: 32768      # 32 GB
-    threads: 16        # 16 threads
+    threads: 8        # 16 threads
     partition: "day"
