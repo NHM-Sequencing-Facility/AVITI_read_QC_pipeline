@@ -118,7 +118,7 @@ def validate_config(config):
         sys.stderr.write("ERROR: Missing 'rules' resource block in config\n")
         sys.exit(1)
 
-    required_rules = ["lane_merge", "fastqc", "fastp", "seqkit", "multiqc"]
+    required_rules = ["lane_merge", "fastqc", "fastp", "seqkit", "multiqc", "mapping"]
     missing_rules = [r for r in required_rules if r not in config["rules"]]
     if missing_rules:
         sys.stderr.write(f"ERROR: Missing resource definitions for rules: {', '.join(missing_rules)}\n")
@@ -642,16 +642,6 @@ mapping_enabled   = mapping_cfg.get("enabled", False)
 mapping_reference = mapping_cfg.get("reference", "")
 mapping_keep_bam  = mapping_cfg.get("keep_bam", False)
 
-# Resources for the optional mapping stage. Merged over defaults rather than indexed
-# out of rule_resources directly, so that a config.yaml predating the mapping stage
-# (i.e. with no rules.mapping block) still parses.
-mapping_res = {
-    "threads": 16,
-    "mem_mb": 32768,
-    "partition": "day",
-    **rule_resources.get("mapping", {}),
-}
-
 lane_merge_dir  = os.path.join(output_dir, "00_lane_merge")
 pre_qc_dir      = os.path.join(output_dir, "01_pre_qc")
 fastp_dir       = os.path.join(output_dir, "02_fastp")
@@ -673,16 +663,6 @@ mapping_targets = (
     mapping_flagstats + [os.path.join(mapping_dir, f"{run_name}_flagstat_summary.tsv")]
     if mapping_enabled else []
 )
-
-# Outputs of rule reference_mapping. The BAM/BAI are declared only when they are being
-# kept, so that Snakemake tracks and cleans them; the default streaming path writes no
-# BAM at all. Built here rather than inline in the rule so it is plain Python.
-mapping_outputs = {
-    "flagstat": os.path.join(mapping_dir, "{sample}", "{sample}.flagstat"),
-}
-if mapping_keep_bam:
-    mapping_outputs["bam"] = os.path.join(mapping_dir, "{sample}", "{sample}.sorted.bam")
-    mapping_outputs["bai"] = os.path.join(mapping_dir, "{sample}", "{sample}.sorted.bam.bai")
 
 
 # ===== RULE ALL =====
@@ -1094,8 +1074,7 @@ if mapping_enabled:
     rule bwa_index:
         # ancient() deliberately ignores the reference FASTA's mtime. Without it, a
         # reference whose timestamp happens to be newer than an existing valid index
-        # would trigger a multi-hour rebuild — which also fails outright when the
-        # reference lives in a read-only shared directory, as is common on HPC.
+        # would trigger a multi-hour rebuild.
         input:
             ref=ancient(mapping_reference)
         output:
@@ -1105,8 +1084,8 @@ if mapping_enabled:
             err=os.path.join(logs_dir, "bwa_index", "bwa_index.err")
         threads: 1
         resources:
-            mem_mb=lambda wildcards, attempt: mapping_res["mem_mb"] * attempt,
-            slurm_partition=mapping_res.get("partition", "")
+            mem_mb=lambda wildcards, attempt: rule_resources["mapping"]["mem_mb"] * attempt,
+            slurm_partition=rule_resources["mapping"].get("partition", "")
         retries: 2
         shell:
             """
@@ -1130,11 +1109,15 @@ if mapping_enabled:
             # Referenced off the index rule so the two lists cannot drift apart
             idx=rules.bwa_index.output
         output:
-            # See mapping_outputs above. Note the flagstat is DEFAULT format, not -O tsv:
-            # MultiQC detects flagstat files by content, matching "in total (QC-passed
-            # reads + QC-failed reads)", and that "in " prefix appears only in the default
-            # format — a tsv-format file would be silently ignored by the report.
-            **mapping_outputs
+            # Flagstat is DEFAULT format, not -O tsv. A tsv-format
+            # file would be silently ignored by the report.
+            flagstat=os.path.join(mapping_dir, "{sample}", "{sample}.flagstat"),
+            # The BAM/BAI are declared only when they are being kept, so that Snakemake
+            # tracks and cleans them; the default streaming path writes no BAM at all.
+            **({
+                "bam": os.path.join(mapping_dir, "{sample}", "{sample}.sorted.bam"),
+                "bai": os.path.join(mapping_dir, "{sample}", "{sample}.sorted.bam.bai"),
+            } if mapping_keep_bam else {})
         params:
             reference=mapping_reference,
             keep_bam=int(mapping_keep_bam),
@@ -1145,10 +1128,10 @@ if mapping_enabled:
         log:
             out=os.path.join(logs_dir, "reference_mapping", "{sample}.out"),
             err=os.path.join(logs_dir, "reference_mapping", "{sample}.err")
-        threads: mapping_res["threads"]
+        threads: rule_resources["mapping"]["threads"]
         resources:
-            mem_mb=lambda wildcards, attempt: mapping_res["mem_mb"] * attempt,
-            slurm_partition=mapping_res.get("partition", "")
+            mem_mb=lambda wildcards, attempt: rule_resources["mapping"]["mem_mb"] * attempt,
+            slurm_partition=rule_resources["mapping"].get("partition", "")
         retries: 2
         shell:
             """
@@ -1229,7 +1212,7 @@ if mapping_enabled:
         threads: 1
         resources:
             mem_mb=4096,
-            slurm_partition=mapping_res.get("partition", "")
+            slurm_partition=rule_resources["mapping"].get("partition", "")
         retries: 2
         shell:
             """
