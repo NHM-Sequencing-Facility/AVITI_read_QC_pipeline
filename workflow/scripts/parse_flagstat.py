@@ -4,9 +4,9 @@
 Reads samtools' DEFAULT flagstat output format (not `-O tsv`). The mapping rule emits
 the default format because MultiQC detects flagstat files by content, matching the
 string "in total (QC-passed reads + QC-failed reads)" - the "in " prefix only appears in
-the default format, so a tsv-format file would be silently ignored by the report. Since
-the default (streaming) mapping path gets only one pass over the alignments, that same
-file has to serve both MultiQC and this summary.
+the default format, so a tsv-format file would be silently ignored by the report. The
+mapping rule writes flagstat once, in that format, and the same file serves both MultiQC
+and this summary.
 
 Each default-format line looks like:
 

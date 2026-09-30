@@ -426,8 +426,8 @@ def build_sample_table(config):
     - Sample unique to one run: included as-is, single-lane copy/symlink path.
     - [SETTINGS] mismatch between any two manifests: hard exit with a clear
       diff of the conflicting keys.
-    - Same sample name but different index pair across runs: warning, 
-     since re-indexing is legitimate, but worth flagging).
+    - Same sample name but different index pair across runs: warning (not an
+      error, since re-indexing is legitimate, but worth flagging).
     """
     manifest_paths = [config["run_manifest"]] + config.get("additional_run_manifests", [])
 
