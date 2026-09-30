@@ -62,14 +62,9 @@ fastp:
 
 # ===== REFERENCE MAPPING =====
 # Aligns each sample's fastp-trimmed reads to a reference genome with BWA-MEM and
-<<<<<<< Updated upstream
-# reports mapping statistics via samtools flagstat. Disabled by default.
-  mapping:
-=======
 # reports mapping statistics via samtools flagstat, per-contig coverage via
 # samtools coverage, and sliding-window mean depth via samtools bedcov.
 # Disabled by default.
->>>>>>> Stashed changes
 mapping:
   enabled: true                # set true to align reads and report mapping stats (default: false)
 
@@ -77,13 +72,7 @@ mapping:
   # The BWA index is built automatically if absent.
   reference: "/hpc/scratch/DP/andie_sif/GCF_902686455.1_mSciVul1.2_genomic.fna.gz"
 
-<<<<<<< Updated upstream
   # Retain a coordinate-sorted, indexed BAM per sample.
-  # false (default).
-  keep_bam: true
-=======
-  # Retain the coordinate-sorted, indexed BAM per sample. A BAM is always written
-  # (coverage needs it); when false it is deleted automatically once coverage is done.
   # false (default).
   keep_bam: true
 
@@ -91,7 +80,6 @@ mapping:
   # from the total reference length: >= 1 Mb -> 10,000 bp; 5 kb - 1 Mb -> 1,000 bp;
   # < 5 kb (e.g. a single gene) -> 3 bp. Set a positive integer to force a fixed size.
   coverage_window_size: null
->>>>>>> Stashed changes
 
 
 # ===== FALCO PARAMETERS =====
@@ -137,11 +125,8 @@ rules:
   mapping:
     mem_mb: 32768      # 32 GB
     threads: 8        # 16 threads
-<<<<<<< Updated upstream
-=======
     partition: "day"
   coverage:            # optional; defaults to 8 GB / 1 thread on the mapping partition
     mem_mb: 8192       # 8 GB
-    threads: 1         # samtools coverage/bedcov are single-threaded
->>>>>>> Stashed changes
+    threads: 1         # 1: samtools coverage/bedcov are single-threaded
     partition: "day"
