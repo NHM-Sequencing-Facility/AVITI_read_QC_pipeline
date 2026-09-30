@@ -154,7 +154,7 @@ output_dir/
 ├── 02_fastp/               # Trimmed reads, fastp HTML/JSON, summary CSV
 ├── 03_post_qc/             # falco reports (post-fastp)
 ├── 04_seqkit/              # seqkit stats per sample
-├── 05_mapping/             # flagstat per sample + summary TSV (only if mapping.enabled)
+├── 05_mapping/             # flagstat + coverage per sample, summary TSV (only if mapping.enabled)
 ├── multiqc_report/         # Aggregated MultiQC HTML report
 └── logs/                   # Per-rule logs and sample_manifest.log
 ```
@@ -174,5 +174,6 @@ output_dir/
 | `bwa index` fails writing to the reference directory | Reference is on read-only or shared storage | Build the index yourself where you have write access: `bwa index /path/to/reference.fasta` |
 | No Samtools section in the MultiQC report | Mapping disabled, or all flagstat files empty | Confirm `mapping.enabled: true` and check `logs/reference_mapping/` |
 | Mapping jobs hit the SLURM walltime | Mapping is hours per sample | Use a longer partition and/or raise `rules.mapping.threads` |
+| Scratch fills up during mapping | A sorted BAM is written per sample for coverage and only deleted after `reference_coverage` finishes (unless `keep_bam: true`, where it is kept) | Allow space for concurrent samples' BAMs, or lower the number of parallel jobs |
 
 ---

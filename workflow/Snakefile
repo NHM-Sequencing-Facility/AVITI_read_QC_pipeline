@@ -31,14 +31,14 @@ def validate_config(config):
             sys.stderr.write(f"ERROR: additional_run_manifests entry not found: {p}\n")
             sys.exit(1)
 
-    # Cross-run merging requires lane_merge to be enabled — merged samples will
+    # Cross-run merging requires lane_merge to be enabled - merged samples will
     # always have n_lanes > 1, which lane_merge.py hard-fails on when disabled
     if extra_manifests:
         lane_merge_enabled = config.get("lane_merge", {}).get("enabled", True)
         if not lane_merge_enabled:
             sys.stderr.write(
                 "ERROR: additional_run_manifests is set but lane_merge.enabled is false. "
-                "Cross-run sample merging requires lane_merge to be enabled — merged "
+                "Cross-run sample merging requires lane_merge to be enabled - merged "
                 "samples will always have n_lanes > 1. "
                 "Set lane_merge.enabled: true in config.yaml.\n"
             )
@@ -79,6 +79,17 @@ def validate_config(config):
         if flag in mapping_cfg and not isinstance(mapping_cfg[flag], bool):
             sys.stderr.write(f"ERROR: mapping.{flag} must be true or false (boolean) in config.yaml\n")
             sys.exit(1)
+
+    # null/absent means the window size is chosen automatically from the reference length
+    window_size = mapping_cfg.get("coverage_window_size")
+    if window_size is not None and (
+        isinstance(window_size, bool) or not isinstance(window_size, int) or window_size < 1
+    ):
+        sys.stderr.write(
+            "ERROR: mapping.coverage_window_size must be a positive integer, or null for "
+            "automatic sizing, in config.yaml\n"
+        )
+        sys.exit(1)
 
     # A reference is only required when mapping is switched on, so that configs which
     # never use the optional stage do not have to carry a reference path
@@ -134,7 +145,6 @@ def parse_run_manifest(manifest_path):
     Returns:
         samples_section (list of dicts): rows from [SAMPLES] block, excluding PhiX
             and commented-out lines.
-        skipped (list of str): sample names excluded (PhiX or commented).
         settings (dict): key/value pairs from [SETTINGS] block.
     """
     settings = {}
@@ -206,9 +216,6 @@ def parse_run_manifest(manifest_path):
 def group_samples_by_index(samples_rows):
     """
     Group manifest rows by (Index1, Index2) pair.
-
-    Returns:
-        groups (dict): { (index1, index2): [row, ...] }
     """
     groups = {}
     for row in samples_rows:
@@ -270,10 +277,6 @@ def index_fastq_files(samples_dir):
     """
     Walk samples_dir once and return a dict mapping basename -> full path
     for every *.fastq.gz file found recursively.
-
-    This single traversal replaces per-sample glob calls, which are slow on
-    networked HPC filesystems (one recursive glob per sample x 96 samples
-    can take several minutes).
     """
     index = {}
     pattern = os.path.join(samples_dir, "**", "*.fastq.gz")
@@ -297,9 +300,6 @@ def find_fastq_files(sample_name, fastq_index):
     Query the pre-built fastq_index (basename -> path) for files belonging
     to sample_name. Applies the same strict prefix filter as before to avoid
     e.g. Pan1 matching Pan1a.
-
-    Returns:
-        r1_files (list), r2_files (list) - both sorted for deterministic lane order.
     """
     r1_pat = re.compile(rf"^{re.escape(sample_name)}_.*R1.*\.fastq\.gz$")
     r2_pat = re.compile(rf"^{re.escape(sample_name)}_.*R2.*\.fastq\.gz$")
@@ -313,9 +313,7 @@ def find_fastq_files(sample_name, fastq_index):
 def parse_single_run(manifest_path):
     """
     Parse one manifest and its sibling Samples/ directory into a per-run
-    sample table. Duplicate base_name within a single run is still a hard
-    error (two different index pairs resolving to the same name is a manifest
-    mistake). Cross-run duplicates are handled by build_sample_table.
+    sample table. Cross-run duplicates are handled by build_sample_table.
     """
     manifest_rows, initially_skipped, settings = parse_run_manifest(manifest_path)
     groups = group_samples_by_index(manifest_rows)
@@ -392,7 +390,6 @@ def apply_sample_aliases(run_table, alias_reverse):
     """
     Rename base_names in run_table according to alias_reverse (variant -> canonical).
     Returns the renamed table and the set of variant names that were matched.
-    Samples with no alias entry pass through unchanged.
     """
     new_table = {}
     matched_variants = set()
@@ -429,11 +426,8 @@ def build_sample_table(config):
     - Sample unique to one run: included as-is, single-lane copy/symlink path.
     - [SETTINGS] mismatch between any two manifests: hard exit with a clear
       diff of the conflicting keys.
-    - Same sample name but different index pair across runs: warning (not
-      an error, since re-indexing is legitimate, but worth flagging).
-
-    Returns sample_sources in addition to the standard tuple so write_manifest_log
-    can record which manifest(s) contributed files to each sample.
+    - Same sample name but different index pair across runs: warning, 
+     since re-indexing is legitimate, but worth flagging).
     """
     manifest_paths = [config["run_manifest"]] + config.get("additional_run_manifests", [])
 
@@ -464,7 +458,7 @@ def build_sample_table(config):
         all_skipped.extend(run_skipped)
         all_warnings.extend(run_warnings)
 
-        # Settings consistency check — exit on any key mismatch
+        # Settings consistency check - exit on any key mismatch
         if merged_settings is None:
             merged_settings = run_settings
         else:
@@ -641,6 +635,15 @@ mapping_cfg       = config.get("mapping", {})
 mapping_enabled   = mapping_cfg.get("enabled", False)
 mapping_reference = mapping_cfg.get("reference", "")
 mapping_keep_bam  = mapping_cfg.get("keep_bam", False)
+# None = pick the sliding-window size from the total reference length (see reference_coverage)
+mapping_window_override = mapping_cfg.get("coverage_window_size")
+# Resources for reference_coverage. Optional so that existing configs keep working.
+coverage_resources = rule_resources.get("coverage", {})
+
+
+def bam_output(path):
+    """Keep the BAM/BAI when keep_bam is set, otherwise mark them temp() for auto-deletion."""
+    return path if mapping_keep_bam else temp(path)
 
 lane_merge_dir  = os.path.join(output_dir, "00_lane_merge")
 pre_qc_dir      = os.path.join(output_dir, "01_pre_qc")
@@ -659,8 +662,15 @@ mapping_flagstats = (
     expand(os.path.join(mapping_dir, "{sample}", "{sample}.flagstat"), sample=SAMPLES)
     if mapping_enabled else []
 )
+mapping_coverage_summaries = (
+    expand(os.path.join(mapping_dir, "{sample}", "{sample}.coverage_summary.txt"), sample=SAMPLES)
+    if mapping_enabled else []
+)
 mapping_targets = (
-    mapping_flagstats + [os.path.join(mapping_dir, f"{run_name}_flagstat_summary.tsv")]
+    mapping_flagstats
+    + mapping_coverage_summaries
+    + expand(os.path.join(mapping_dir, "{sample}", "{sample}.sliding_window_coverage.tsv"), sample=SAMPLES)
+    + [os.path.join(mapping_dir, f"{run_name}_flagstat_summary.tsv")]
     if mapping_enabled else []
 )
 
@@ -781,7 +791,7 @@ rule pre_fastqc:
 
         # Check for empty input (placeholder from lane_merge)
         if [[ ! -s "{input.r1}" ]] || [[ ! -s "{input.r2}" ]]; then
-            echo "WARNING: Input file(s) are empty — sample had no usable reads after lane merge." >> {log.out}
+            echo "WARNING: Input file(s) are empty - sample had no usable reads after lane merge." >> {log.out}
             echo "Creating empty placeholder outputs and skipping falco." >> {log.out}
             touch {output.r1_html} {output.r1_zip} {output.r2_html} {output.r2_zip}
             echo "Completed (skipped): $(date)" >> {log.out}
@@ -891,7 +901,7 @@ rule fastp:
 
         # Check for empty input (placeholder from lane_merge)
         if [[ ! -s "{input.r1}" ]] || [[ ! -s "{input.r2}" ]]; then
-            echo "WARNING: Input file(s) are empty — sample had no usable reads after lane merge." >> {log.out}
+            echo "WARNING: Input file(s) are empty - sample had no usable reads after lane merge." >> {log.out}
             echo "Creating empty placeholder outputs and skipping fastp." >> {log.out}
             touch {output.r1} {output.r2} {output.html} {output.json}
             echo "Completed (skipped): $(date)" >> {log.out}
@@ -963,7 +973,7 @@ rule post_fastqc:
 
         # Check for empty input (placeholder from fastp skip)
         if [[ ! -s "{input.r1}" ]] || [[ ! -s "{input.r2}" ]]; then
-            echo "WARNING: Input file(s) are empty — sample had no usable reads after fastp." >> {log.out}
+            echo "WARNING: Input file(s) are empty - sample had no usable reads after fastp." >> {log.out}
             echo "Creating empty placeholder outputs and skipping falco." >> {log.out}
             touch {output.r1_html} {output.r1_zip} {output.r2_html} {output.r2_zip}
             echo "Completed (skipped): $(date)" >> {log.out}
@@ -1044,7 +1054,7 @@ rule seqkit_stats:
 
         # Check for empty input (placeholder from fastp skip)
         if [[ ! -s "{input.r1}" ]] || [[ ! -s "{input.r2}" ]]; then
-            echo "WARNING: Input file(s) are empty — sample had no usable reads after fastp." >> {log.out}
+            echo "WARNING: Input file(s) are empty - sample had no usable reads after fastp." >> {log.out}
             echo "Creating empty placeholder output and skipping seqkit stats." >> {log.out}
             touch {output.stats}
             echo "Completed (skipped): $(date)" >> {log.out}
@@ -1065,9 +1075,7 @@ rule seqkit_stats:
 
 
 # ===== RULES: OPTIONAL REFERENCE MAPPING =====
-# Defined only when mapping.enabled is true, so that a run with mapping switched off
-# never evaluates an unset reference path and the workflow DAG is byte-for-byte what it
-# was before this stage existed.
+# Defined only when mapping.enabled = true
 
 if mapping_enabled:
 
@@ -1112,18 +1120,13 @@ if mapping_enabled:
             # Flagstat is DEFAULT format, not -O tsv. A tsv-format
             # file would be silently ignored by the report.
             flagstat=os.path.join(mapping_dir, "{sample}", "{sample}.flagstat"),
-            # The BAM/BAI are declared only when they are being kept, so that Snakemake
-            # tracks and cleans them; the default streaming path writes no BAM at all.
-            **({
-                "bam": os.path.join(mapping_dir, "{sample}", "{sample}.sorted.bam"),
-                "bai": os.path.join(mapping_dir, "{sample}", "{sample}.sorted.bam.bai"),
-            } if mapping_keep_bam else {})
+            # A sorted, indexed BAM is always needed by reference_coverage. Unless keep_bam
+            # is set it is temp(), so Snakemake deletes it once coverage has consumed it.
+            bam=bam_output(os.path.join(mapping_dir, "{sample}", "{sample}.sorted.bam")),
+            bai=bam_output(os.path.join(mapping_dir, "{sample}", "{sample}.sorted.bam.bai"))
         params:
             reference=mapping_reference,
             keep_bam=int(mapping_keep_bam),
-            # Always set so the shell can reference it in either branch, even when the
-            # BAM is not a declared output.
-            bam=os.path.join(mapping_dir, "{sample}", "{sample}.sorted.bam"),
             sort_tmp=os.path.join(mapping_dir, "{sample}", "{sample}.sorttmp")
         log:
             out=os.path.join(logs_dir, "reference_mapping", "{sample}.out"),
@@ -1151,50 +1154,147 @@ if mapping_enabled:
 
             # Check for empty input (placeholder from fastp skip)
             if [[ ! -s "{input.r1}" ]] || [[ ! -s "{input.r2}" ]]; then
-                echo "WARNING: Input file(s) are empty — sample had no usable reads after fastp." >> {log.out}
+                echo "WARNING: Input file(s) are empty - sample had no usable reads after fastp." >> {log.out}
                 echo "Creating empty placeholder output(s) and skipping mapping." >> {log.out}
                 touch {output}
                 echo "Completed (skipped): $(date)" >> {log.out}
                 exit 0
             fi
 
-            if [[ "{params.keep_bam}" -eq 1 ]]; then
-                # -T keeps sort temp files inside the sample's output directory: with
-                # retries and --rerun-incomplete, a killed sort would otherwise scatter
-                # temp files through the default location.
-                echo "Mapping and writing sorted BAM" >> {log.out}
-                bwa mem \
-                    -t {threads} \
-                    -R '@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tPL:ILLUMINA' \
-                    {params.reference} \
-                    {input.r1} {input.r2} \
-                    2>> {log.err} \
-                  | samtools sort -@ {threads} -T {params.sort_tmp} -o {params.bam} - \
-                    2>> {log.err}
+            # -T keeps sort temp files inside the sample's output directory: with
+            # retries and --rerun-incomplete, a killed sort would otherwise scatter
+            # temp files through the default location.
+            echo "Mapping and writing sorted BAM" >> {log.out}
+            bwa mem \
+                -t {threads} \
+                -R '@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tPL:ILLUMINA' \
+                {params.reference} \
+                {input.r1} {input.r2} \
+                2>> {log.err} \
+              | samtools sort -@ {threads} -T {params.sort_tmp} -o {output.bam} - \
+                2>> {log.err}
 
-                samtools index -@ {threads} {params.bam} >> {log.out} 2>> {log.err}
-                samtools flagstat -@ {threads} {params.bam} > {output.flagstat} 2>> {log.err}
+            samtools index -@ {threads} {output.bam} >> {log.out} 2>> {log.err}
+            samtools flagstat -@ {threads} {output.bam} > {output.flagstat} 2>> {log.err}
 
-                echo "BAM size: $(numfmt --to=iec $(stat -c%s {params.bam}))" >> {log.out}
-            else
-                # flagstat does not require sorted input, so stream straight into it and
-                # never write a BAM. This is the default because a sorted BAM at typical
-                # AVITI depths is tens of GB per sample.
-                echo "Mapping and streaming to flagstat (no BAM retained)" >> {log.out}
-                bwa mem \
-                    -t {threads} \
-                    -R '@RG\\tID:{wildcards.sample}\\tSM:{wildcards.sample}\\tPL:ILLUMINA' \
-                    {params.reference} \
-                    {input.r1} {input.r2} \
-                    2>> {log.err} \
-                  | samtools flagstat -@ {threads} - \
-                    > {output.flagstat} \
-                    2>> {log.err}
+            echo "BAM size: $(numfmt --to=iec $(stat -c%s {output.bam}))" >> {log.out}
+            if [[ "{params.keep_bam}" -ne 1 ]]; then
+                echo "keep_bam is false: BAM will be deleted after reference_coverage" >> {log.out}
             fi
 
             echo "Completed: $(date)" >> {log.out}
             echo "Flagstat output:" >> {log.out}
             cat {output.flagstat} >> {log.out}
+            """
+
+
+    rule reference_coverage:
+        # Per-contig coverage (samtools coverage) plus mean depth in fixed-size sliding
+        # windows (samtools bedcov). Unless mapping.coverage_window_size overrides it, the
+        # window size is chosen from the TOTAL reference length, one size per sample:
+        #   >= 1,000,000 bp (nuclear genome)   -> 10,000bp windows
+        #   5,000 - 999,999 bp (mito/plastid)  ->  1,000bp windows
+        #   < 5,000 bp (single gene, e.g. COI) ->      3bp windows
+        input:
+            bam=rules.reference_mapping.output.bam,
+            bai=rules.reference_mapping.output.bai
+        output:
+            summary=os.path.join(mapping_dir, "{sample}", "{sample}.coverage_summary.txt"),
+            windows=os.path.join(mapping_dir, "{sample}", "{sample}.sliding_window_coverage.tsv")
+        params:
+            # 0 = automatic sizing
+            window_override=mapping_window_override or 0,
+            # Intermediates share a prefix so they can be removed together at the end
+            tmp_prefix=os.path.join(mapping_dir, "{sample}", "{sample}.covtmp")
+        log:
+            out=os.path.join(logs_dir, "reference_coverage", "{sample}.out"),
+            err=os.path.join(logs_dir, "reference_coverage", "{sample}.err")
+        threads: coverage_resources.get("threads", 1)
+        resources:
+            mem_mb=lambda wildcards, attempt: coverage_resources.get("mem_mb", 8192) * attempt,
+            slurm_partition=coverage_resources.get(
+                "partition", rule_resources["mapping"].get("partition", ""))
+        retries: 2
+        shell:
+            """
+            set -euo pipefail
+
+            mkdir -p $(dirname {output.summary})
+            mkdir -p $(dirname {log.out})
+
+            echo "======== reference coverage: {wildcards.sample} ========" > {log.out}
+            echo "Started  : $(date)" >> {log.out}
+            echo "Input BAM: {input.bam}" >> {log.out}
+
+            # Check for empty input (placeholder from reference_mapping skip)
+            if [[ ! -s "{input.bam}" ]]; then
+                echo "WARNING: Input BAM is empty - sample had no usable reads after fastp." >> {log.out}
+                echo "Creating empty placeholder outputs and skipping coverage." >> {log.out}
+                touch {output.summary} {output.windows}
+                echo "Completed (skipped): $(date)" >> {log.out}
+                exit 0
+            fi
+
+            echo "Calculating per-contig average coverage" >> {log.out}
+            samtools coverage -o {output.summary} {input.bam} 2>> {log.err}
+
+            # Contig lengths from the BAM header, i.e. the reference the reads were mapped to
+            samtools view -H {input.bam} 2>> {log.err} \
+              | awk -F'\\t' '/^@SQ/ {{
+                    chr=""; len="";
+                    for (i=1; i<=NF; i++) {{
+                        if ($i ~ /^SN:/) chr=substr($i,4);
+                        if ($i ~ /^LN:/) len=substr($i,4)+0;
+                    }}
+                    print chr"\\t"len
+                }}' > {params.tmp_prefix}.chrom_sizes.txt
+
+            total_len=$(awk '{{s+=$2}} END {{printf "%d", s}}' {params.tmp_prefix}.chrom_sizes.txt)
+
+            if [[ "{params.window_override}" -gt 0 ]]; then
+                window_size={params.window_override}
+                window_source="mapping.coverage_window_size override"
+            elif [[ "$total_len" -ge 1000000 ]]; then
+                window_size=10000
+                window_source="auto: reference >= 1 Mb"
+            elif [[ "$total_len" -ge 5000 ]]; then
+                window_size=1000
+                window_source="auto: reference 5 kb - 1 Mb"
+            else
+                window_size=3
+                window_source="auto: reference < 5 kb"
+            fi
+            echo "Total reference length: $total_len bp" >> {log.out}
+            echo "Window size           : $window_size bp ($window_source)" >> {log.out}
+
+            echo "Generating sliding-window coverage" >> {log.out}
+            awk -v w="$window_size" 'BEGIN {{OFS="\\t"}} {{
+                    chr=$1; len=$2;
+                    for (start=0; start<len; start+=w) {{
+                        end = start+w;
+                        if (end>len) end=len;
+                        print chr, start, end;
+                    }}
+                }}' {params.tmp_prefix}.chrom_sizes.txt > {params.tmp_prefix}.windows.bed
+
+            samtools bedcov {params.tmp_prefix}.windows.bed {input.bam} \
+                > {params.tmp_prefix}.windows_rawcov.tsv 2>> {log.err}
+
+            # bedcov reports summed per-base depth; divide by window length for mean depth
+            awk 'BEGIN {{OFS="\\t"; print "chrom","start","end","mean_depth"}} {{
+                    len = $3-$2;
+                    mean = (len>0) ? $4/len : 0;
+                    print $1,$2,$3,mean;
+                }}' {params.tmp_prefix}.windows_rawcov.tsv > {output.windows}
+
+            rm -f {params.tmp_prefix}.chrom_sizes.txt \
+                  {params.tmp_prefix}.windows.bed \
+                  {params.tmp_prefix}.windows_rawcov.tsv
+
+            echo "Completed: $(date)" >> {log.out}
+            echo "Coverage outputs:" >> {log.out}
+            echo "  Per-contig average: {output.summary}" >> {log.out}
+            echo "  Sliding window    : {output.windows}" >> {log.out}
             """
 
 
@@ -1296,6 +1396,8 @@ rule multiqc:
         expand(os.path.join(seqkit_dir, "{sample}", "{sample}_seqkit_stats.txt"), sample=SAMPLES),
         # samtools flagstat (empty list when mapping.enabled is false)
         mapping_flagstats,
+        # samtools coverage per-contig summaries (empty list when mapping.enabled is false)
+        mapping_coverage_summaries,
         # MultiQC config
         config_yaml=os.path.normpath(os.path.join(workflow.basedir, "..", "config", "multiqc_config.yaml"))
     output:

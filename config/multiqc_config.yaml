@@ -22,8 +22,14 @@ module_order:
   - seqkit
   # Only present when mapping.enabled is true in config.yaml; MultiQC ignores
   # module_order entries whose module finds no files, so this is harmless when
-  # the optional mapping stage is switched off.
+  # the optional mapping stage is switched off. Covers both flagstat and
+  # samtools coverage ({sample}.coverage_summary.txt) outputs.
   - samtools
+
+# Strip the coverage file suffix so samtools coverage rows use the bare sample name
+# and line up with the flagstat rows for the same sample.
+extra_fn_clean_exts:
+  - ".coverage_summary"
 
 # ---- Drop fastp's plot sections that duplicate FastQC's ----
 # Sequence quality, GC content and N content are kept from FastQC instead.

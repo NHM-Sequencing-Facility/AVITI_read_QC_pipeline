@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-lane_merge.py
-=============
-Merge (concatenate) R1 and R2 FASTQ files across lanes for a single sample.
+lane_merge.py - Merge (concatenate) R1 and R2 FASTQ files across lanes for a single sample.
 
 Called by the lane_merge Snakemake rule. Accepts all parameters via CLI so
 the rule can be submitted as a proper cluster job.
@@ -59,7 +57,7 @@ def parse_args():
     # rather than a single `nargs=2` pair. Single-indexed runs (e.g. AVITI
     # manifests with no Index2 column) legitimately have an empty Index2, and
     # an empty string interpolated unquoted into a shell command disappears
-    # entirely — which previously left argparse one token short for
+    # entirely - which previously left argparse one token short for
     # `--index-key` (which required exactly two values) and crashed with
     # "expected 2 arguments". Splitting into two flags means each one is
     # valid on its own, including when empty.
@@ -166,22 +164,22 @@ def main():
                 msg = (
                     f"ERROR: Sample '{args.sample}' has {n_lanes} lanes but "
                     f"lane_merge is disabled. Multi-lane samples cannot be "
-                    f"processed without merging — set lane_merge.enabled: true "
+                    f"processed without merging - set lane_merge.enabled: true "
                     f"in config.yaml, or fix the manifest grouping."
                 )
                 write_log(log, msg)
                 sys.stderr.write(msg + "\n")
                 sys.exit(1)
-            write_log(log, "Single lane — symlinking instead of copying (lane_merge disabled).")
+            write_log(log, "Single lane - symlinking instead of copying (lane_merge disabled).")
             symlink_files(args.r1[0], args.r2[0], args.out_r1, args.out_r2, log)
         elif n_lanes == 1:
-            write_log(log, "Single lane — copying directly (no concatenation).")
+            write_log(log, "Single lane - copying directly (no concatenation).")
             shutil.copy2(args.r1[0], args.out_r1)
             shutil.copy2(args.r2[0], args.out_r2)
             write_log(log, f"Copied R1: {args.r1[0]} → {args.out_r1}")
             write_log(log, f"Copied R2: {args.r2[0]} → {args.out_r2}")
         else:
-            write_log(log, f"Multi-lane ({n_lanes} lanes) — concatenating.\n")
+            write_log(log, f"Multi-lane ({n_lanes} lanes) - concatenating.\n")
             concatenate_files(args.r1, args.out_r1, "R1", log)
             concatenate_files(args.r2, args.out_r2, "R2", log)
 

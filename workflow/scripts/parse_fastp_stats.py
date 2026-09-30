@@ -43,10 +43,6 @@ def empty_sample_stats():
 
 def parse_fastp_json(json_path):
     """Parse fastp JSON file and extract specified statistics.
-
-    Returns a stats dict, or None if the file exists but could not be parsed.
-    A zero-byte file is not an error: it is the placeholder written for samples
-    with no usable reads, and yields zero-filled stats.
     """
     try:
         if os.path.getsize(json_path) == 0:
@@ -310,7 +306,7 @@ def main():
         print(f"MultiQC general stats yaml: {args.output_mqc}", file=sys.stderr)
 
     # A non-empty but unparseable JSON means fastp itself failed for that sample.
-    # Fail loudly rather than shipping a QC summary that is silently missing samples.
+    # Fail rather than shipping a QC summary that is silently missing samples.
     if failed_samples:
         print(f"\nERROR: {len(failed_samples)} fastp JSON report(s) could not be parsed:",
               file=sys.stderr)

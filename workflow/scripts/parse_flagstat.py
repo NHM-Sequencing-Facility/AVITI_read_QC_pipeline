@@ -3,7 +3,7 @@
 
 Reads samtools' DEFAULT flagstat output format (not `-O tsv`). The mapping rule emits
 the default format because MultiQC detects flagstat files by content, matching the
-string "in total (QC-passed reads + QC-failed reads)" — the "in " prefix only appears in
+string "in total (QC-passed reads + QC-failed reads)" - the "in " prefix only appears in
 the default format, so a tsv-format file would be silently ignored by the report. Since
 the default (streaming) mapping path gets only one pass over the alignments, that same
 file has to serve both MultiQC and this summary.
@@ -32,7 +32,7 @@ STATUS_EMPTY = 'empty_input'
 FLAGSTAT_LINE = re.compile(r'^(\d+)\s*\+\s*(\d+)\s+(.+?)\s*$')
 
 # samtools appends its percentage annotation as "(97.24% : N/A)", and "(N/A : N/A)" when
-# the denominator is zero — so keying on '%' would miss the zero case. The ' : ' separator
+# the denominator is zero - so keying on '%' would miss the zero case. The ' : ' separator
 # is the reliable signature. Crucially this leaves "(mapQ>=5)" alone, which carries meaning
 # and distinguishes that metric from its non-mapQ counterpart.
 TRAILING_PCT = re.compile(r'\s*\([^)]*:[^)]*\)\s*$')
@@ -80,9 +80,9 @@ HEADER = [
 def normalise_label(label):
     """Reduce a raw flagstat line label to the key used in COUNT_COLUMNS.
 
-    Strips samtools' percentage annotation, then folds the total line — written as
+    Strips samtools' percentage annotation, then folds the total line - written as
     "in total (QC-passed reads + QC-failed reads)", whose parenthesised part contains no
-    colon and so survives the strip — down to plain "total".
+    colon and so survives the strip - down to plain "total".
     """
     label = TRAILING_PCT.sub('', label).strip()
     if label.startswith('in total'):
@@ -94,7 +94,7 @@ def pct(numerator, denominator):
     """Percentage to 2dp, or 'NA' when the denominator is zero or unavailable.
 
     An unmapped or empty sample legitimately has a zero denominator, so this must not
-    raise — it mirrors the pct() helper in the standalone mapNstat.sh script.
+    raise - it mirrors the pct() helper in the standalone mapNstat.sh script.
     """
     try:
         denominator = float(denominator)

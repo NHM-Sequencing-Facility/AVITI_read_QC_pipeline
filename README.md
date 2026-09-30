@@ -54,9 +54,9 @@ The pipeline comprises the following main steps:
 5. **Rule 3 — `fastp`** — Trims adapters, filters by quality and length, and deduplicates reads. Poly-G and poly-X tail trimming and overlap-based base correction are optional. Trimmed reads and HTML/JSON reports are written to `02_fastp/{sample}/`. See [Interpreting duplication metrics](#interpreting-duplication-metrics) for what `dedup` does and does not remove.
 6. **Rule 4 — `post_fastqc`** — Repeats falco QC on the fastp-trimmed reads, writing to `03_post_qc/{sample}/`.
 7. **Rule 5 — `seqkit_stats`** — Runs `seqkit stats --all --tabular` on both trimmed R1 and R2, writing a tab-separated stats file to `04_seqkit/{sample}/{sample}_seqkit_stats.txt`.
-8. **Rules 5a–5c — `bwa_index`, `reference_mapping`, `mapping_summary`** *(optional)* — Only present when `mapping.enabled: true`. Aligns each sample's trimmed reads to a reference genome with BWA-MEM (tagged with `@RG ID/SM`), builds the BWA index first if it is missing, and computes `samtools flagstat` into `05_mapping/{sample}/{sample}.flagstat`. `mapping_summary` compiles all per-sample reports into `05_mapping/{run_name}_flagstat_summary.tsv` (calls `workflow/scripts/parse_flagstat.py`). See [Reference mapping](#reference-mapping).
+8. **Rules 5a–5d — `bwa_index`, `reference_mapping`, `reference_coverage`, `mapping_summary`** *(optional)* — Only present when `mapping.enabled: true`. Aligns each sample's trimmed reads to a reference genome with BWA-MEM (tagged with `@RG ID/SM`), builds the BWA index first if it is missing, writes a sorted, indexed BAM and computes `samtools flagstat` into `05_mapping/{sample}/{sample}.flagstat`. `reference_coverage` runs `samtools coverage` (per-contig summary) and `samtools bedcov` over sliding windows whose size is chosen from the reference length. `mapping_summary` compiles all per-sample reports into `05_mapping/{run_name}_flagstat_summary.tsv` (calls `workflow/scripts/parse_flagstat.py`). See [Reference mapping](#reference-mapping).
 9. **Rule 6 — `fastp_summary`** — Walks `02_fastp/`, finds all per-sample JSON reports, and compiles them into a single CSV at `02_fastp/{run_name}_fastp_summary.csv`. Also writes `{run_name}_general_stats_mqc.yaml`, which injects accurate raw and final read/base counts (from `summary.before_filtering` and `summary.after_filtering`) into the MultiQC General Statistics table — correcting for the fastp module's default use of `filtering_result.passed_filter_reads`, which is measured before deduplication (calls `workflow/scripts/parse_fastp_stats.py`). Every sample gets a row: samples with no usable reads are recorded as zero with `status: empty_input`, rather than being omitted. A fastp JSON that exists but cannot be parsed fails the rule, since that means fastp itself did not finish.
-10. **Rule 7 — `multiqc`** — Searches `01_pre_qc/`, `02_fastp/`, `03_post_qc/`, `04_seqkit/` (and `05_mapping/` when mapping is enabled), and aggregates all falco zips, fastp JSONs, seqkit stats files, samtools flagstat reports, and the custom general-stats YAML into a single HTML report in `multiqc_report/`.
+10. **Rule 7 — `multiqc`** — Searches `01_pre_qc/`, `02_fastp/`, `03_post_qc/`, `04_seqkit/` (and `05_mapping/` when mapping is enabled), and aggregates all falco zips, fastp JSONs, seqkit stats files, samtools flagstat and coverage reports, and the custom general-stats YAML into a single HTML report in `multiqc_report/`.
 
 
 <div align="center">
@@ -96,7 +96,15 @@ Each key becomes the sample name used throughout all outputs. Samples not listed
 ### Reference mapping
 Optional, off by default. Each sample's fastp-trimmed reads are aligned with `bwa mem`, read groups are tagged `@RG ID:{sample} SM:{sample} PL:ILLUMINA`, and `samtools flagstat` produces `05_mapping/{sample}/{sample}.flagstat`. Those per-sample reports are compiled into `05_mapping/{run_name}_flagstat_summary.tsv` and are also picked up natively by MultiQC, which adds a Samtools Flagstat section and mapping columns to the General Statistics table.
 
+<<<<<<< Updated upstream
 **`keep_bam`:** The default (`false`) pipes `bwa mem` straight into `samtools flagstat`. Setting it `true` writes `{sample}.sorted.bam` plus its index. Leave it `false` unless you need the alignments for downstream work.
+=======
+**Coverage:** `reference_coverage` writes two files per sample:
+- `{sample}.coverage_summary.txt` — `samtools coverage` per-contig table (reads, covered bases, % breadth, mean depth, mean base/mapping quality). MultiQC picks this up in its Samtools section.
+- `{sample}.sliding_window_coverage.tsv` — mean depth (`chrom start end mean_depth`) in fixed-size windows, from `samtools bedcov`. The window size is chosen once per run from the **total** reference length (sum of all contigs): ≥ 1 Mb (nuclear genome) → 10,000 bp; 5 kb – 1 Mb (mitogenome, plastome) → 1,000 bp; < 5 kb (single gene, e.g. COI) → 3 bp. Set `mapping.coverage_window_size` to force a fixed size. The total length and chosen size are recorded in `logs/reference_coverage/{sample}.out`.
+
+**`keep_bam`:** Coverage needs a coordinate-sorted, indexed BAM, so `{sample}.sorted.bam` plus its index are always written. With the default (`false`) they are Snakemake `temp()` files and are deleted automatically once coverage has run for that sample; setting it `true` retains them. Note that each sample's BAM (tens of GB at typical AVITI depths) exists on disk until its coverage job finishes, so allow scratch space for the number of samples mapped concurrently.
+>>>>>>> Stashed changes
 
 **The BWA index building:** If index files are missing. For a read-only or shared reference, build it yourself first with `bwa index /path/to/reference.fasta`. An existing index is never rebuilt, even if the FASTA's timestamp is newer. Note the flagstat files are in samtools' **default** output format, not `-O tsv`. MultiQC identifies flagstat reports by matching the string `in total (QC-passed reads + QC-failed reads)`.
 
@@ -139,7 +147,8 @@ Optional, off by default. Each sample's fastp-trimmed reads are aligned with `bw
 |---|---|---|
 | `mapping.enabled` | Align reads to a reference and report mapping stats. When `false`, no mapping jobs are added to the workflow | `false` |
 | `mapping.reference` | Path to the reference genome FASTA. Required when `enabled: true`. BWA-indexed automatically if the index is absent (needs a writable reference directory) | `""` |
-| `mapping.keep_bam` | Retain a coordinate-sorted, indexed BAM per sample. `false` streams `bwa mem` into `samtools flagstat` without sorting or writing a BAM; `true` costs tens of GB per sample | `false` |
+| `mapping.keep_bam` | Retain the coordinate-sorted, indexed BAM per sample. A BAM is always written for coverage; `false` deletes it once coverage has run, `true` keeps it (tens of GB per sample) | `false` |
+| `mapping.coverage_window_size` | Sliding-window size (bp) for `{sample}.sliding_window_coverage.tsv`. `null` chooses it from the total reference length (≥ 1 Mb → 10,000; 5 kb – 1 Mb → 1,000; < 5 kb → 3); a positive integer forces a fixed size | `null` |
 
 **MultiQC**
 | Parameter | Description | Default |
@@ -156,8 +165,9 @@ Each rule block accepts `mem_mb`, `threads`, and `partition` (SLURM partition na
 | `seqkit` | 16384 | 8 |
 | `multiqc` | 16384 | 2 |
 | `mapping` | 32768 | 16 |
+| `coverage` *(optional)* | 8192 | 1 |
 
-`mapping` is only used when `mapping.enabled: true`, and is deliberately larger than the others because BWA-MEM holds the whole reference index in memory. If the block is omitted from `config.yaml` entirely, the defaults above are used.
+`mapping` is only used when `mapping.enabled: true`, and is deliberately larger than the others because BWA-MEM holds the whole reference index in memory. `coverage` is used by `reference_coverage` and may be omitted; it then defaults to the values above on the `mapping` partition. If the block is omitted from `config.yaml` entirely, the defaults above are used.
 
 
 ---
@@ -196,9 +206,11 @@ output_dir/
 │       └── {sample}_seqkit_stats.txt
 ├── 05_mapping/                 # Only when mapping.enabled: true
 │   ├── {sample}/
-│   │   ├── {sample}.flagstat             # samtools flagstat, default format
-│   │   ├── {sample}.sorted.bam           # only when keep_bam: true
-│   │   └── {sample}.sorted.bam.bai       # only when keep_bam: true
+│   │   ├── {sample}.flagstat                    # samtools flagstat, default format
+│   │   ├── {sample}.coverage_summary.txt        # samtools coverage, per contig
+│   │   ├── {sample}.sliding_window_coverage.tsv # mean depth per window
+│   │   ├── {sample}.sorted.bam                  # kept only when keep_bam: true
+│   │   └── {sample}.sorted.bam.bai              # kept only when keep_bam: true
 │   └── {run_name}_flagstat_summary.tsv   # Compiled per-sample mapping metrics
 ├── multiqc_report/
 │   ├── {run_name}_multiqc_report.html
@@ -213,6 +225,7 @@ output_dir/
     ├── fastp_summary/
     ├── bwa_index/              # Only when mapping.enabled: true
     ├── reference_mapping/      # Only when mapping.enabled: true
+    ├── reference_coverage/     # Only when mapping.enabled: true
     ├── mapping_summary/        # Only when mapping.enabled: true
     └── multiqc/
 ```
