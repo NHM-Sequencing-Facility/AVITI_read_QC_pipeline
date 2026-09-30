@@ -96,16 +96,10 @@ Each key becomes the sample name used throughout all outputs. Samples not listed
 ### Reference mapping
 Optional, off by default. Each sample's fastp-trimmed reads are aligned with `bwa mem`, read groups are tagged `@RG ID:{sample} SM:{sample} PL:ILLUMINA`, and `samtools flagstat` produces `05_mapping/{sample}/{sample}.flagstat`. Those per-sample reports are compiled into `05_mapping/{run_name}_flagstat_summary.tsv` and are also picked up natively by MultiQC, which adds a Samtools Flagstat section and mapping columns to the General Statistics table.
 
-<<<<<<< Updated upstream
 **`keep_bam`:** The default (`false`) pipes `bwa mem` straight into `samtools flagstat`. Setting it `true` writes `{sample}.sorted.bam` plus its index. Leave it `false` unless you need the alignments for downstream work.
-=======
 **Coverage:** `reference_coverage` writes two files per sample:
 - `{sample}.coverage_summary.txt` — `samtools coverage` per-contig table (reads, covered bases, % breadth, mean depth, mean base/mapping quality). MultiQC picks this up in its Samtools section.
 - `{sample}.sliding_window_coverage.tsv` — mean depth (`chrom start end mean_depth`) in fixed-size windows, from `samtools bedcov`. The window size is chosen once per run from the **total** reference length (sum of all contigs): ≥ 1 Mb (nuclear genome) → 10,000 bp; 5 kb – 1 Mb (mitogenome, plastome) → 1,000 bp; < 5 kb (single gene, e.g. COI) → 3 bp. Set `mapping.coverage_window_size` to force a fixed size. The total length and chosen size are recorded in `logs/reference_coverage/{sample}.out`.
-
-**`keep_bam`:** Coverage needs a coordinate-sorted, indexed BAM, so `{sample}.sorted.bam` plus its index are always written. With the default (`false`) they are Snakemake `temp()` files and are deleted automatically once coverage has run for that sample; setting it `true` retains them. Note that each sample's BAM (tens of GB at typical AVITI depths) exists on disk until its coverage job finishes, so allow scratch space for the number of samples mapped concurrently.
->>>>>>> Stashed changes
-
 **The BWA index building:** If index files are missing. For a read-only or shared reference, build it yourself first with `bwa index /path/to/reference.fasta`. An existing index is never rebuilt, even if the FASTA's timestamp is newer. Note the flagstat files are in samtools' **default** output format, not `-O tsv`. MultiQC identifies flagstat reports by matching the string `in total (QC-passed reads + QC-failed reads)`.
 
 ## Key parameters in `config/config.yaml`
