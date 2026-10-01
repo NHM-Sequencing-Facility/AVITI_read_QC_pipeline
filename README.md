@@ -5,6 +5,8 @@
 A Snakemake pipeline for QC of raw, basecalled and demultiplexed AVITI24 sequence data, written for the MBL/SeqFac team @NHMUK.
  
 The pipeline parses one or more AVITI24 `RunManifest.csv` files and their sibling `Samples/` directories, concatenates lane replicates (where required), runs pre-QC falco (FastQC-compatible), fastp adapter trimming and quality filtering, post-QC falco, and seqkit stats. It then produces a per-run fastp summary CSV and aggregates everything into a single MultiQC report. PhiX entries are excluded automatically.
+
+Optionally, the trimmed reads can also be mapped to a reference genome with BWA-MEM. Each sample then gets `samtools flagstat` mapping statistics, a per-contig `samtools coverage` summary, and a sliding-window mean-depth table whose window size is chosen from the reference length (e.g. nuclear genome, mitogenome or single gene). These are compiled into a per-run summary and added to the MultiQC report.
  
 ---
 
@@ -30,6 +32,10 @@ conda activate aviti_read_qc_pipeline
 | multiqc | 1.33 |
 | seqkit | 2.13.0 |
 | zip | 3.0 |
+| bwa | 0.7.19 |
+| samtools | 1.23.1 |
+
+`bwa` and `samtools` are used only by the optional reference-mapping stage (`mapping.enabled: true`).
  
 3. You are now ready to configure and run the pipeline (see below).
 
@@ -39,8 +45,8 @@ conda activate aviti_read_qc_pipeline
  
 1. Follow the installation and conda environment creation steps above.
 2. Populate `config/config.yaml` with the required run parameters and paths (see [Key parameters](#key-parameters-in-configconfigyaml) below).
-3. Edit the conda `source` line in `aviti_read_qc_pipeline.sh` to point to your `conda.sh`, and update your NHM email address.
-4. Run `sbatch aviti_read_qc_pipeline.slurm` to submit all jobs to a SLURM HPC cluster.
+3. Edit the conda `source` line in `run_pipeline.sh` to point to your `conda.sh` (and the `--configfile` path, if you are not using `config/config.yaml`).
+4. Run `sbatch run_pipeline.sh` to submit all jobs to a SLURM HPC cluster.
 > **A detailed, step-by-step SOP can be found [here](https://github.com/NHM-Sequencing-Facility/AVITI_read_QC_pipeline/blob/main/SOP_README.md).**
 
 ---
@@ -51,7 +57,7 @@ The pipeline comprises the following main steps:
 2. **Sample grouping** — Samples are grouped by matching `Index1 + Index2` pair to identify lane replicates. When `additional_run_manifests` are provided, samples appearing in more than one run have their FASTQ file lists merged across runs. Settings blocks from all manifests are compared and the pipeline exits with a clear diff if any key differs. A summary is written to `logs/sample_manifest.log`.
 3. **Rule 1 — `lane_merge`** — Lane replicates are concatenated into a single R1/R2 pair per sample (calls `workflow/scripts/lane_merge.py`). Single-lane samples are copied directly. When `lane_merge.enabled: false`, single-lane samples are symlinked instead of copied; multi-lane samples raise an error (merging is required and cannot be skipped). Empty inputs produce placeholder files that propagate gracefully through all downstream rules.
 4. **Rule 2 — `pre_fastqc`** — Runs falco on the merged R1 and R2 reads, writing HTML/data/summary files and zip archives to `01_pre_qc/{sample}/` for MultiQC.
-5. **Rule 3 — `fastp`** — Trims adapters, filters by quality and length, and deduplicates reads. Poly-G and poly-X tail trimming and overlap-based base correction are optional. Trimmed reads and HTML/JSON reports are written to `02_fastp/{sample}/`. See [Interpreting duplication metrics](#interpreting-duplication-metrics) for what `dedup` does and does not remove.
+5. **Rule 3 — `fastp`** — Trims adapters, filters by quality and length, and deduplicates reads. Poly-G and poly-X tail trimming and overlap-based base correction are optional. Trimmed reads and HTML/JSON reports are written to `02_fastp/{sample}/`. `dedup` removes duplicate read *pairs* on untrimmed sequence; see the notes on the duplication columns in the MultiQC report for how this differs from falco's per-read duplication estimate.
 6. **Rule 4 — `post_fastqc`** — Repeats falco QC on the fastp-trimmed reads, writing to `03_post_qc/{sample}/`.
 7. **Rule 5 — `seqkit_stats`** — Runs `seqkit stats --all --tabular` on both trimmed R1 and R2, writing a tab-separated stats file to `04_seqkit/{sample}/{sample}_seqkit_stats.txt`.
 8. **Rules 5a–5d — `bwa_index`, `reference_mapping`, `reference_coverage`, `mapping_summary`** *(optional)* — Only present when `mapping.enabled: true`. Aligns each sample's trimmed reads to a reference genome with BWA-MEM (tagged with `@RG ID/SM`), builds the BWA index first if it is missing, writes a sorted, indexed BAM and computes `samtools flagstat` into `05_mapping/{sample}/{sample}.flagstat`. `reference_coverage` runs `samtools coverage` (per-contig summary) and `samtools bedcov` over sliding windows whose size is chosen from the reference length. `mapping_summary` compiles all per-sample reports into `05_mapping/{run_name}_flagstat_summary.tsv` (calls `workflow/scripts/parse_flagstat.py`). See [Reference mapping](#reference-mapping).
@@ -96,11 +102,13 @@ Each key becomes the sample name used throughout all outputs. Samples not listed
 ### Reference mapping
 Optional, off by default. Each sample's fastp-trimmed reads are aligned with `bwa mem`, read groups are tagged `@RG ID:{sample} SM:{sample} PL:ILLUMINA`, and `samtools flagstat` produces `05_mapping/{sample}/{sample}.flagstat`. Those per-sample reports are compiled into `05_mapping/{run_name}_flagstat_summary.tsv` and are also picked up natively by MultiQC, which adds a Samtools Flagstat section and mapping columns to the General Statistics table.
 
-**`keep_bam`:** The default (`false`) pipes `bwa mem` straight into `samtools flagstat`. Setting it `true` writes `{sample}.sorted.bam` plus its index. Leave it `false` unless you need the alignments for downstream work.
 **Coverage:** `reference_coverage` writes two files per sample:
 - `{sample}.coverage_summary.txt` — `samtools coverage` per-contig table (reads, covered bases, % breadth, mean depth, mean base/mapping quality). MultiQC picks this up in its Samtools section.
 - `{sample}.sliding_window_coverage.tsv` — mean depth (`chrom start end mean_depth`) in fixed-size windows, from `samtools bedcov`. The window size is chosen once per run from the **total** reference length (sum of all contigs): ≥ 1 Mb (nuclear genome) → 10,000 bp; 5 kb – 1 Mb (mitogenome, plastome) → 1,000 bp; < 5 kb (single gene, e.g. COI) → 3 bp. Set `mapping.coverage_window_size` to force a fixed size. The total length and chosen size are recorded in `logs/reference_coverage/{sample}.out`.
-**The BWA index building:** If index files are missing. For a read-only or shared reference, build it yourself first with `bwa index /path/to/reference.fasta`. An existing index is never rebuilt, even if the FASTA's timestamp is newer. Note the flagstat files are in samtools' **default** output format, not `-O tsv`. MultiQC identifies flagstat reports by matching the string `in total (QC-passed reads + QC-failed reads)`.
+
+**`keep_bam`:** Coverage needs a coordinate-sorted, indexed BAM, so `{sample}.sorted.bam` plus its index are always written. With the default (`false`) they are Snakemake `temp()` files and are deleted automatically once coverage has run for that sample; setting it `true` retains them. Note that each sample's BAM (tens of GB at typical AVITI depths) exists on disk until its coverage job finishes, so allow scratch space for the number of samples mapped concurrently.
+
+**BWA index:** The index is built automatically if its files are missing next to the reference FASTA, which needs a writable reference directory. For a read-only or shared reference, build it yourself first with `bwa index /path/to/reference.fasta`. An existing index is never rebuilt, even if the FASTA's timestamp is newer. Note the flagstat files are in samtools' **default** output format, not `-O tsv`. MultiQC identifies flagstat reports by matching the string `in total (QC-passed reads + QC-failed reads)`.
 
 ## Key parameters in `config/config.yaml`
 **General**
@@ -150,7 +158,7 @@ Optional, off by default. Each sample's fastp-trimmed reads are aligned with `bw
 | `multiqc.extra_args` | Any additional MultiQC arguments as a raw string | `""` |
  
 **Resource allocation (`rules`)**
-Each rule block accepts `mem_mb`, `threads`, and `partition` (SLURM partition name). Memory is scaled by retry attempt number on failure (up to the configured `retries` count per rule).
+Each rule block accepts `mem_mb`, `threads`, and `partition` (SLURM partition name). The values below are those in the template `config/config.yaml`. Memory is scaled by retry attempt number on failure (up to the configured `retries` count per rule).
 | Rule | Default mem_mb | Default threads |
 |---|---|---|
 | `lane_merge` | 16384 | 8 |
@@ -158,10 +166,10 @@ Each rule block accepts `mem_mb`, `threads`, and `partition` (SLURM partition na
 | `fastp` | 16384 | 8 |
 | `seqkit` | 16384 | 8 |
 | `multiqc` | 16384 | 2 |
-| `mapping` | 32768 | 16 |
+| `mapping` | 32768 | 8 |
 | `coverage` *(optional)* | 8192 | 1 |
 
-`mapping` is only used when `mapping.enabled: true`, and is deliberately larger than the others because BWA-MEM holds the whole reference index in memory. `coverage` is used by `reference_coverage` and may be omitted; it then defaults to the values above on the `mapping` partition. If the block is omitted from `config.yaml` entirely, the defaults above are used.
+`mapping` is only used when `mapping.enabled: true`, and is deliberately larger than the others because BWA-MEM holds the whole reference index in memory. The `lane_merge`, `fastqc`, `fastp`, `seqkit`, `multiqc` and `mapping` blocks are all required (the pipeline exits with an error if any is missing, even when mapping is disabled). `coverage` is used by `reference_coverage` and is optional; if omitted it defaults to 8 GB / 1 thread on the `mapping` partition.
 
 
 ---
@@ -245,4 +253,6 @@ This Snakemake pipeline was written by Dan Parsons for the NHMUK Molecular Biolo
 | fastp | https://github.com/OpenGene/fastp | [Chen, 2025](https://onlinelibrary.wiley.com/doi/10.1002/imt2.70078) | 1.3.1 |
 | MultiQC | https://github.com/MultiQC/MultiQC | [Ewels et al., 2016](https://academic.oup.com/bioinformatics/article/32/19/3047/2196507) | 1.33 |
 | seqkit | https://github.com/shenwei356/seqkit | [Shen et al., 2024](https://onlinelibrary.wiley.com/doi/10.1002/imt2.191) | 2.13.0 |
+| BWA | https://github.com/lh3/bwa | [Li & Durbin, 2009](https://doi.org/10.1093/bioinformatics/btp324) | 0.7.19 |
+| SAMtools | https://github.com/samtools/samtools | [Danecek et al., 2021](https://doi.org/10.1093/gigascience/giab008) | 1.23.1 |
 
