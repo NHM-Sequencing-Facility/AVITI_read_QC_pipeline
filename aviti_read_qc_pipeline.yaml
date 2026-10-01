@@ -8,9 +8,8 @@ dependencies:
   - falco=1.2.5
   - multiqc=1.33
   - seqkit=2.13.0
-  # Used only by the optional reference-mapping stage (mapping.enabled in config.yaml)
-  - bwa=0.7.18
-  - samtools=1.21
+  - bwa=0.7.19
+  - samtools=1.23.1
   - zip=3.0
   - python=3.12
   - snakemake=9.9.0
