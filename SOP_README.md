@@ -1,7 +1,7 @@
 ---
 title: "SOP: Running the AVITI Read QC Pipeline"
 author: "Dan Parsons @NHMUK"
-date: "`14.04.2026`"
+date: "`01.10.2026`"
 ---
 
 ## Overview
